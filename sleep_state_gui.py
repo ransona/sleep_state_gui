@@ -20,7 +20,11 @@ from scipy import signal
 from scipy.interpolate import interp1d
 
 import organise_paths
-from sleep_score import run_sleep_scoring
+from sleep_score import (
+    run_sleep_scoring,
+    score_from_epoch_features,
+    build_epoch_feature_dict,
+)
 
 
 # -----------------------------
@@ -159,6 +163,10 @@ class VideoAnalysisApp(QMainWindow):
         # eye frame times
         self.eye_frame_times = None
 
+        # cached epoch features for rescoring
+        self.epoch_features_data = None
+        self._state_dirty = False
+
         # Matplotlib widgets/objects
         self.figure = None
         self.canvas = None
@@ -279,6 +287,17 @@ class VideoAnalysisApp(QMainWindow):
         self.thresholdEditCheck.setEnabled(False)
         self.thresholdEditCheck.setChecked(True)
         satLayout.addWidget(self.thresholdEditCheck)
+
+        satLayout.addSpacing(12)
+        self.autoRescoreCheck = QCheckBox("Auto rescore")
+        self.autoRescoreCheck.setEnabled(False)
+        self.autoRescoreCheck.setChecked(False)
+        satLayout.addWidget(self.autoRescoreCheck)
+
+        self.rescoreButton = QPushButton("Rescore")
+        self.rescoreButton.setEnabled(False)
+        self.rescoreButton.clicked.connect(self.onRescoreClicked)
+        satLayout.addWidget(self.rescoreButton)
 
         satLayout.addStretch(1)
         mainLayout.addLayout(satLayout)
@@ -433,6 +452,17 @@ class VideoAnalysisApp(QMainWindow):
         if not np.isfinite(self.delta_power_threshold):
             self.delta_power_threshold = float(np.nanmean(self.delta_power))
 
+        stored_features = sleep_state.get("epoch_features")
+        self.epoch_features_data = None
+        if stored_features is not None:
+            try:
+                self.epoch_features_data = {
+                    key: np.asarray(val, dtype=float)
+                    for key, val in stored_features.items()
+                }
+            except Exception:
+                self.epoch_features_data = None
+
         # fallback labels
         if self.state_label_map is None and 'state_labels' in sleep_state:
             labels_obj = sleep_state['state_labels']
@@ -479,8 +509,12 @@ class VideoAnalysisApp(QMainWindow):
         self.satPercentEdit.setEnabled(True)
         self.locSdEdit.setEnabled(True)
         self.thresholdEditCheck.setEnabled(True)
+        self.autoRescoreCheck.setEnabled(True)
+        self.autoRescoreCheck.setChecked(False)
+        self.rescoreButton.setEnabled(True)
 
         self.loaded = True
+        self._state_dirty = False
 
         # Build epoch features for interactive reclassification
         self._rebuild_epoch_features()
@@ -796,6 +830,22 @@ class VideoAnalysisApp(QMainWindow):
         Build epoch-level features needed for interactive reclassification
         from the stored sleep_state fields.
         """
+        stored = getattr(self, "epoch_features_data", None)
+        if stored is not None:
+            self.emg_rms_mean_by_epoch = np.asarray(
+                stored.get("emg_rms_mean", []), dtype=float
+            )
+            self.wheel_speed_mean_by_epoch = np.asarray(
+                stored.get("wheel_speed_mean", []), dtype=float
+            )
+            self.theta_delta_ratio_smoothed = np.asarray(
+                stored.get("theta_delta_ratio_smoothed", []), dtype=float
+            )
+            self.delta_power_smoothed = np.asarray(
+                stored.get("delta_power_smoothed", []), dtype=float
+            )
+            return
+
         # Epoch means for EMG RMS and wheel from 10Hz traces
         self.emg_rms_mean_by_epoch = self._epoch_mean_from_timeseries(
             self.emg_rms_10hz_t, self.emg_rms_10hz, self.epoch_t
@@ -804,12 +854,25 @@ class VideoAnalysisApp(QMainWindow):
             self.wheel_10hz_t, self.wheel_10hz, self.epoch_t
         )
 
-        # Ratio + smoothing
-        ratio = np.asarray(self.theta_power, dtype=float) / np.asarray(self.delta_power, dtype=float)
+        theta_power = np.asarray(self.theta_power, dtype=float)
+        delta_power = np.asarray(self.delta_power, dtype=float)
+
+        ratio = theta_power / delta_power
         ratio[~np.isfinite(ratio)] = np.nan
 
         self.theta_delta_ratio_smoothed = self._adaptive_savgol(ratio, base_window=11)
-        self.delta_power_smoothed = self._adaptive_savgol(self.delta_power, base_window=11)
+        self.delta_power_smoothed = self._adaptive_savgol(delta_power, base_window=11)
+
+        self.epoch_features_data = build_epoch_feature_dict(
+            self.epoch_t,
+            theta_power,
+            delta_power,
+            self.emg_rms_mean_by_epoch,
+            self.wheel_speed_mean_by_epoch,
+            theta_delta_ratio=ratio,
+            theta_delta_ratio_smoothed=self.theta_delta_ratio_smoothed,
+            delta_power_smoothed=self.delta_power_smoothed,
+        )
 
     # -----------------------------
     # Manual state assignment (no functionality loss)
@@ -836,49 +899,36 @@ class VideoAnalysisApp(QMainWindow):
         # Only update state plot (avoid full rebuild)
         self._update_state_axis_only()
 
-    # -----------------------------
-    # Classification (interactive)
-    # -----------------------------
-    def _classify_states_epoch(self):
-        """
-        Same logic as scoring function (state codes 0..3).
-        Uses current thresholds stored in self.*_threshold fields.
-        """
-        emg = np.asarray(self.emg_rms_mean_by_epoch, dtype=float)
-        wheel = np.asarray(self.wheel_speed_mean_by_epoch, dtype=float)
-        ratio = np.asarray(self.theta_delta_ratio_smoothed, dtype=float)
-        delta_sm = np.asarray(self.delta_power_smoothed, dtype=float)
-
-        n = emg.size
-        out = np.zeros(n, dtype=np.int8)
-
-        emg_thr = float(self.emg_rms_threshold)
-        wheel_thr = float(self.wheel_speed_threshold)
-        ratio_thr = float(self.theta_delta_ratio_threshold)
-        delta_thr = float(self.delta_power_threshold)
-
-        for i in range(n):
-            moving = (emg[i] >= emg_thr) or (abs(wheel[i]) > wheel_thr)
-            if moving:
-                out[i] = 0
-            elif ratio[i] > ratio_thr and emg[i] < emg_thr:
-                out[i] = 3
-            elif delta_sm[i] >= delta_thr and emg[i] < emg_thr:
-                out[i] = 2
-            else:
-                out[i] = 1
-        return out
-
     def rerun_classification(self):
         """
         Recompute state_epoch and state_10hz, then update only the state axis.
         """
         if not self.loaded:
             return
-        if self.emg_rms_mean_by_epoch is None:
+        if self.epoch_features_data is None:
             self._rebuild_epoch_features()
+        thresholds = {
+            "emg_rms_threshold": float(self.emg_rms_threshold),
+            "wheel_speed_threshold": float(self.wheel_speed_threshold),
+            "theta_delta_ratio_threshold": float(self.theta_delta_ratio_threshold),
+            "delta_power_threshold": float(self.delta_power_threshold),
+        }
+        try:
+            state_epoch, resolved = score_from_epoch_features(
+                self.epoch_features_data,
+                thresholds=thresholds,
+                auto_thresholds=False,
+            )
+        except Exception as exc:
+            QMessageBox.critical(self, "Rescore error", f"Error during rescoring:\n{exc}")
+            return
 
-        self.state_epoch = self._classify_states_epoch().astype(np.int8)
+        self.emg_rms_threshold = float(resolved["emg_rms_threshold"])
+        self.wheel_speed_threshold = float(resolved["wheel_speed_threshold"])
+        self.theta_delta_ratio_threshold = float(resolved["theta_delta_ratio_threshold"])
+        self.delta_power_threshold = float(resolved["delta_power_threshold"])
+
+        self.state_epoch = state_epoch.astype(np.int8)
 
         interp = interp1d(
             self.epoch_t,
@@ -889,7 +939,14 @@ class VideoAnalysisApp(QMainWindow):
         )
         self.state_10hz = interp(self.state_10hz_t).astype(np.int8)
 
+        self._state_dirty = False
+        self._sync_threshold_widgets_to_values()
         self._update_state_axis_only()
+
+    def onRescoreClicked(self):
+        if not self.loaded:
+            return
+        self.rerun_classification()
 
     # -----------------------------
     # Threshold widgets (drag + slider sync)
@@ -907,6 +964,45 @@ class VideoAnalysisApp(QMainWindow):
         except Exception:
             pass
         return True
+
+    def _auto_rescore_enabled(self):
+        return (
+            self.autoRescoreCheck.isEnabled()
+            and self.autoRescoreCheck.isChecked()
+        )
+
+    def _handle_threshold_change(self):
+        self._state_dirty = True
+        if self._auto_rescore_enabled():
+            self.rerun_classification()
+
+    def _sync_threshold_widgets_to_values(self):
+        if (
+            self._thr_drag_emg is None
+            and self._thr_drag_wheel is None
+            and self._thr_drag_ratio is None
+        ):
+            return
+        self._syncing_slider = True
+        try:
+            if self._thr_drag_emg is not None:
+                self._thr_drag_emg.set_y(float(self.emg_rms_threshold), trigger_callback=False)
+            if self._slider_emg is not None:
+                self._slider_emg.set_val(float(self.emg_rms_threshold))
+
+            if self._thr_drag_wheel is not None:
+                self._thr_drag_wheel.set_y(float(self.wheel_speed_threshold), trigger_callback=False)
+            if self._slider_wheel is not None:
+                self._slider_wheel.set_val(float(self.wheel_speed_threshold))
+
+            if self._thr_drag_ratio is not None:
+                self._thr_drag_ratio.set_y(float(self.theta_delta_ratio_threshold), trigger_callback=False)
+            if self._slider_ratio is not None:
+                self._slider_ratio.set_val(float(self.theta_delta_ratio_threshold))
+        except Exception:
+            pass
+        finally:
+            self._syncing_slider = False
 
     def _disconnect_threshold_widgets(self):
         for obj in [self._thr_drag_emg, self._thr_drag_wheel, self._thr_drag_ratio]:
@@ -985,7 +1081,7 @@ class VideoAnalysisApp(QMainWindow):
                     self._slider_emg.set_val(float(y))
                 finally:
                     self._syncing_slider = False
-            self.rerun_classification()
+            self._handle_threshold_change()
 
         def on_wheel_drag(y):
             if self._syncing_slider:
@@ -997,7 +1093,7 @@ class VideoAnalysisApp(QMainWindow):
                     self._slider_wheel.set_val(float(y))
                 finally:
                     self._syncing_slider = False
-            self.rerun_classification()
+            self._handle_threshold_change()
 
         def on_ratio_drag(y):
             if self._syncing_slider:
@@ -1009,7 +1105,7 @@ class VideoAnalysisApp(QMainWindow):
                     self._slider_ratio.set_val(float(y))
                 finally:
                     self._syncing_slider = False
-            self.rerun_classification()
+            self._handle_threshold_change()
 
         # Create draggable lines (each owns its line)
         self._thr_drag_emg = DraggableHLine(

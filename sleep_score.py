@@ -9,8 +9,20 @@ from scipy import signal
 from scipy.signal import butter, filtfilt
 from scipy.interpolate import interp1d
 from sklearn.mixture import GaussianMixture
+from typing import Dict, Optional, Tuple
 
 import organise_paths
+
+
+# ---------------------------------------------------------------------
+# types / helper hints
+# ---------------------------------------------------------------------
+
+def _as_float_array(x):
+    arr = np.asarray(x, dtype=float)
+    if arr.ndim == 0:
+        arr = arr.reshape(1)
+    return arr
 
 
 # ---------------------------------------------------------------------
@@ -194,6 +206,169 @@ def epoch_total_power(signal_epochs, fs):
 
 
 # ---------------------------------------------------------------------
+# epoch feature helpers / scoring hooks
+# ---------------------------------------------------------------------
+
+def build_epoch_feature_dict(
+    epoch_time,
+    theta_power_epochs,
+    delta_power_epochs,
+    emg_rms_mean_by_epoch,
+    wheel_speed_mean_by_epoch,
+    *,
+    theta_delta_ratio=None,
+    theta_delta_ratio_smoothed=None,
+    delta_power_smoothed=None,
+):
+    """
+    Bundle epoch-level summary data required for reclassification.
+    """
+    epoch_time = _as_float_array(epoch_time).astype(np.float64)
+    theta_power_epochs = _as_float_array(theta_power_epochs).astype(np.float32)
+    delta_power_epochs = _as_float_array(delta_power_epochs).astype(np.float32)
+    emg_rms_mean_by_epoch = _as_float_array(emg_rms_mean_by_epoch).astype(np.float32)
+    wheel_speed_mean_by_epoch = _as_float_array(
+        wheel_speed_mean_by_epoch
+    ).astype(np.float32)
+
+    if theta_delta_ratio is None:
+        ratio = np.divide(
+            theta_power_epochs,
+            delta_power_epochs,
+            out=np.full_like(theta_power_epochs, np.nan),
+            where=np.isfinite(delta_power_epochs) & (delta_power_epochs != 0),
+        )
+    else:
+        ratio = _as_float_array(theta_delta_ratio)
+
+    if theta_delta_ratio_smoothed is None:
+        ratio_smoothed = _adaptive_savgol(ratio, SAVGOL_BASE_WIN).astype(np.float32)
+    else:
+        ratio_smoothed = _as_float_array(theta_delta_ratio_smoothed).astype(np.float32)
+
+    if delta_power_smoothed is None:
+        delta_power_smoothed = _adaptive_savgol(
+            delta_power_epochs, SAVGOL_BASE_WIN
+        ).astype(np.float32)
+    else:
+        delta_power_smoothed = _as_float_array(delta_power_smoothed).astype(np.float32)
+
+    return {
+        "epoch_time": epoch_time,
+        "theta_power": theta_power_epochs,
+        "delta_power": delta_power_epochs,
+        "theta_delta_ratio": ratio.astype(np.float32),
+        "theta_delta_ratio_smoothed": ratio_smoothed,
+        "delta_power_smoothed": delta_power_smoothed,
+        "emg_rms_mean": emg_rms_mean_by_epoch,
+        "wheel_speed_mean": wheel_speed_mean_by_epoch,
+    }
+
+
+def estimate_thresholds_from_epoch_features(epoch_features: Dict) -> Dict[str, float]:
+    """
+    Estimate thresholds using the current automated heuristics.
+    """
+    emg_vals = _as_float_array(epoch_features["emg_rms_mean"])
+    delta_power_smoothed = _as_float_array(epoch_features["delta_power_smoothed"])
+
+    n_epochs = emg_vals.size
+    if n_epochs < 2:
+        emg_threshold = float(
+            np.nanmean(emg_vals) + EMG_SD_MULT * np.nanstd(emg_vals)
+        )
+    else:
+        emg_rms_reshaped = emg_vals.reshape(-1, 1)
+        gmm = GaussianMixture(n_components=2)
+        gmm.fit(emg_rms_reshaped)
+        emg_component_idx = gmm.predict(emg_rms_reshaped)
+        comp_means = [
+            np.nanmean(emg_vals[emg_component_idx == i]) for i in range(2)
+        ]
+        low_emg_comp = int(np.nanargmin(comp_means))
+        low_emg_values = emg_vals[emg_component_idx == low_emg_comp]
+        emg_threshold = float(
+            np.nanmean(low_emg_values) + EMG_SD_MULT * np.nanstd(low_emg_values)
+        )
+
+    # Maintain current behaviour: theta/delta threshold hard-coded
+    theta_ratio_thr = 2.0
+    delta_power_thr = float(np.nanmean(delta_power_smoothed))
+
+    return {
+        "emg_rms_threshold": emg_threshold,
+        "wheel_speed_threshold": float(WHEEL_SPEED_THRESHOLD),
+        "theta_delta_ratio_threshold": theta_ratio_thr,
+        "delta_power_threshold": delta_power_thr,
+    }
+
+
+def score_from_epoch_features(
+    epoch_features: Dict,
+    thresholds: Optional[Dict[str, float]] = None,
+    auto_thresholds: bool = False,
+) -> Tuple[np.ndarray, Dict[str, float]]:
+    """
+    Classify sleep states given epoch-level summary data.
+
+    Parameters
+    ----------
+    epoch_features : dict
+        Output of build_epoch_feature_dict (or equivalent).
+    thresholds : dict, optional
+        Manual thresholds. Missing entries fall back to auto-estimated values.
+    auto_thresholds : bool
+        When True, ignore manual thresholds and estimate using the automated heuristics.
+
+    Returns
+    -------
+    state_epoch : np.ndarray (int8)
+        Classified state per epoch (0=active wake, ...).
+    resolved_thresholds : dict
+        Threshold values actually used.
+    """
+    auto_vals = estimate_thresholds_from_epoch_features(epoch_features)
+
+    if auto_thresholds or thresholds is None:
+        resolved = auto_vals
+    else:
+        resolved = auto_vals.copy()
+        for key, val in thresholds.items():
+            if val is None:
+                continue
+            if key in resolved:
+                resolved[key] = float(val)
+
+    emg = _as_float_array(epoch_features["emg_rms_mean"])
+    wheel = _as_float_array(epoch_features["wheel_speed_mean"])
+    ratio = _as_float_array(epoch_features["theta_delta_ratio_smoothed"])
+    delta_sm = _as_float_array(epoch_features["delta_power_smoothed"])
+
+    n = emg.size
+    if wheel.size != n or ratio.size != n or delta_sm.size != n:
+        raise ValueError("epoch feature arrays must have matching lengths")
+
+    emg_thr = resolved["emg_rms_threshold"]
+    wheel_thr = resolved["wheel_speed_threshold"]
+    ratio_thr = resolved["theta_delta_ratio_threshold"]
+    delta_thr = resolved["delta_power_threshold"]
+
+    out = np.empty(n, dtype=np.int8)
+    for i in range(n):
+        moving = (emg[i] >= emg_thr) or (abs(wheel[i]) > wheel_thr)
+        if moving:
+            out[i] = STATE_ACTIVE_WAKE
+        elif ratio[i] > ratio_thr and emg[i] < emg_thr:
+            out[i] = STATE_REM
+        elif delta_sm[i] >= delta_thr and emg[i] < emg_thr:
+            out[i] = STATE_NREM
+        else:
+            out[i] = STATE_QUIET_WAKE
+
+    return out.astype(np.int8), resolved
+
+
+# ---------------------------------------------------------------------
 # QC plotting (single function, called once at end)
 # ---------------------------------------------------------------------
 
@@ -302,6 +477,7 @@ def run_sleep_scoring(user_id, exp_id):
         - moving-window EEG spectrogram (5 s window, 2 s stride)
         - state classification (per epoch and 10 Hz)
         - thresholds used for classification
+        - epoch_features dict for quick rescoring
     """
     start_time = time.time()
     print(f"starting sleep scoring for user_id={user_id}, exp_id={exp_id}")
@@ -417,63 +593,35 @@ def run_sleep_scoring(user_id, exp_id):
     # -------------------------------------------------------------
     # 8. thresholds and state classification
     # -------------------------------------------------------------
-    print("[9/9] estimating emg threshold via gmm and classifying states")
+    print("[9/9] estimating thresholds and classifying states")
     emg_rms_mean_by_epoch = emg_rms_epochs.mean(axis=1)
     wheel_speed_mean_by_epoch = wheel_speed_epochs.mean(axis=1)
 
-    # GMM for EMG
-    if n_epochs < 2:
-        emg_threshold = emg_rms_mean_by_epoch.mean() + \
-                        EMG_SD_MULT * emg_rms_mean_by_epoch.std()
-    else:
-        emg_rms_reshaped = emg_rms_mean_by_epoch.reshape(-1, 1)
-        gmm = GaussianMixture(n_components=2)
-        gmm.fit(emg_rms_reshaped)
-        emg_component_idx = gmm.predict(emg_rms_reshaped)
+    epoch_features = build_epoch_feature_dict(
+        epoch_time,
+        theta_power_epochs,
+        delta_power_epochs,
+        emg_rms_mean_by_epoch,
+        wheel_speed_mean_by_epoch,
+        theta_delta_ratio=theta_delta_ratio,
+        theta_delta_ratio_smoothed=theta_delta_ratio_smoothed,
+        delta_power_smoothed=delta_power_smoothed,
+    )
 
-        comp_means = [emg_rms_mean_by_epoch[emg_component_idx == i].mean()
-                      for i in range(2)]
-        low_emg_comp = int(np.argmin(comp_means))
-        low_emg_values = emg_rms_mean_by_epoch[emg_component_idx == low_emg_comp]
-        emg_threshold = low_emg_values.mean() + EMG_SD_MULT * low_emg_values.std()
+    sleep_state_epoch, thresholds_used = score_from_epoch_features(
+        epoch_features,
+        auto_thresholds=True,
+    )
+
+    emg_threshold = thresholds_used["emg_rms_threshold"]
+    wheel_speed_thr = thresholds_used["wheel_speed_threshold"]
+    theta_ratio_thr = thresholds_used["theta_delta_ratio_threshold"]
+    delta_power_thr = thresholds_used["delta_power_threshold"]
 
     print(f"  - emg_threshold: {emg_threshold:.4f}")
-
-    theta_ratio_thr = 2 #theta_delta_ratio_smoothed.mean() + \
-                        #THETA_RATIO_SD_MULT * theta_delta_ratio_smoothed.std()
-    delta_power_thr = float(delta_power_smoothed.mean())
-
     print(f"  - theta_ratio_thr: {theta_ratio_thr:.4f}")
     print(f"  - delta_power_thr: {delta_power_thr:.4f}")
-    print(f"  - wheel_speed_thr: {WHEEL_SPEED_THRESHOLD:.4f}")
-
-    # classify states
-    sleep_state_epoch = np.empty(n_epochs, dtype=np.int8)
-    step = max(1, n_epochs // 20)
-
-    for i in range(n_epochs):
-        emg_val = emg_rms_mean_by_epoch[i]
-        theta_ratio_val = theta_delta_ratio_smoothed[i]
-        delta_power_val = delta_power_smoothed[i]
-        wheel_val = wheel_speed_mean_by_epoch[i]
-
-        moving = (emg_val >= emg_threshold) or (abs(wheel_val) > WHEEL_SPEED_THRESHOLD)
-
-        if moving:
-            state = STATE_ACTIVE_WAKE
-        elif theta_ratio_val > theta_ratio_thr and emg_val < emg_threshold:
-            state = STATE_REM
-        elif delta_power_val >= delta_power_thr and emg_val < emg_threshold:
-            state = STATE_NREM
-        else:
-            state = STATE_QUIET_WAKE
-
-        sleep_state_epoch[i] = state
-
-        if (i + 1) % step == 0 or (i + 1) == n_epochs:
-            progress = (i + 1) / n_epochs * 100
-            print(f"\r    progress (scoring): {progress:5.1f}%", end="")
-    print()
+    print(f"  - wheel_speed_thr: {wheel_speed_thr:.4f}")
 
     # -------------------------------------------------------------
     # 9. downsample to 10 Hz and interpolate states
@@ -537,9 +685,15 @@ def run_sleep_scoring(user_id, exp_id):
 
         # thresholds used for classification
         "emg_rms_threshold": float(emg_threshold),
-        "wheel_speed_threshold": float(WHEEL_SPEED_THRESHOLD),
+        "wheel_speed_threshold": float(wheel_speed_thr),
         "theta_delta_ratio_threshold": float(theta_ratio_thr),
         "delta_power_threshold": float(delta_power_thr),
+
+        # cached epoch features for downstream rescoring
+        "epoch_features": {
+            key: np.asarray(val)
+            for key, val in epoch_features.items()
+        },
     }
 
     print("saving outputs")
