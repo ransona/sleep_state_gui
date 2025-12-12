@@ -8,7 +8,8 @@ import numpy as np
 from PyQt5 import QtWidgets, QtCore, QtGui
 from PyQt5.QtWidgets import (
     QMainWindow, QApplication, QWidget, QVBoxLayout, QHBoxLayout,
-    QLabel, QPushButton, QLineEdit, QSlider, QMessageBox, QSizePolicy, QCheckBox
+    QLabel, QPushButton, QLineEdit, QSlider, QMessageBox, QSizePolicy,
+    QCheckBox, QRadioButton, QButtonGroup
 )
 from PyQt5.QtCore import Qt, QTimer
 
@@ -165,7 +166,11 @@ class VideoAnalysisApp(QMainWindow):
 
         # cached epoch features for rescoring
         self.epoch_features_data = None
+        self.loaded_sleep_state = None
+        self.sleep_state_path = None
         self._state_dirty = False
+        self.selection_patches = []
+        self.available_state_values = set()
 
         # Matplotlib widgets/objects
         self.figure = None
@@ -258,9 +263,9 @@ class VideoAnalysisApp(QMainWindow):
         # --- Video display ---
         videoLayout = QHBoxLayout()
         self.leftVideoLabel = QLabel("Left Eye Video")
-        self.leftVideoLabel.setFixedSize(320, 240)
+        self.leftVideoLabel.setFixedSize(320, 120)
         self.rightVideoLabel = QLabel("Right Eye Video")
-        self.rightVideoLabel.setFixedSize(320, 240)
+        self.rightVideoLabel.setFixedSize(320, 120)
         videoLayout.addWidget(self.leftVideoLabel)
         videoLayout.addWidget(self.rightVideoLabel)
         mainLayout.addLayout(videoLayout)
@@ -283,10 +288,17 @@ class VideoAnalysisApp(QMainWindow):
         satLayout.addWidget(self.locSdEdit)
 
         satLayout.addSpacing(20)
-        self.thresholdEditCheck = QCheckBox("Threshold edit mode")
-        self.thresholdEditCheck.setEnabled(False)
-        self.thresholdEditCheck.setChecked(True)
-        satLayout.addWidget(self.thresholdEditCheck)
+        self.modeThresholdButton = QRadioButton("Threshold mode")
+        self.modeSelectionButton = QRadioButton("Selection mode")
+        self.modeGroup = QButtonGroup(self)
+        self.modeGroup.addButton(self.modeThresholdButton)
+        self.modeGroup.addButton(self.modeSelectionButton)
+        self.modeSelectionButton.setChecked(True)
+        self.modeThresholdButton.setEnabled(False)
+        self.modeSelectionButton.setEnabled(False)
+        self.modeGroup.buttonToggled.connect(self.onModeToggled)
+        satLayout.addWidget(self.modeThresholdButton)
+        satLayout.addWidget(self.modeSelectionButton)
 
         satLayout.addSpacing(12)
         self.autoRescoreCheck = QCheckBox("Auto rescore")
@@ -299,8 +311,22 @@ class VideoAnalysisApp(QMainWindow):
         self.rescoreButton.clicked.connect(self.onRescoreClicked)
         satLayout.addWidget(self.rescoreButton)
 
+        self.saveButton = QPushButton("Save scoring")
+        self.saveButton.setEnabled(False)
+        self.saveButton.clicked.connect(self.saveSleepScoring)
+        satLayout.addWidget(self.saveButton)
+
         satLayout.addStretch(1)
         mainLayout.addLayout(satLayout)
+
+        # --- State assignment controls (buttons + shortcuts) ---
+        stateAssignLayout = QHBoxLayout()
+        stateAssignLayout.addWidget(QLabel("Assign state:"))
+        self.stateButtonsLayout = QHBoxLayout()
+        stateAssignLayout.addLayout(self.stateButtonsLayout)
+        stateAssignLayout.addStretch(1)
+        mainLayout.addLayout(stateAssignLayout)
+        self.state_buttons = []
 
         # --- Matplotlib canvas ---
         self.figure = Figure(figsize=(8, 8))
@@ -315,10 +341,7 @@ class VideoAnalysisApp(QMainWindow):
 
         # --- shortcuts for state assignment (0–3) ---
         self.state_shortcuts = []
-        for s in range(4):
-            sc = QtWidgets.QShortcut(QtGui.QKeySequence(str(s)), self)
-            sc.activated.connect(lambda val=s: self.assign_state_key(val))
-            self.state_shortcuts.append(sc)
+        self.state_shortcut_map = {}
 
     # -----------------------------
     # Load data
@@ -389,8 +412,19 @@ class VideoAnalysisApp(QMainWindow):
                 with open(sleep_state_path, "rb") as f:
                     sleep_state = pickle.load(f)
             except Exception as e:
-                QMessageBox.critical(self, "Data Error", f"Error loading sleep_state.pickle:\n{e}")
-                return
+                reply = QMessageBox.question(
+                    self,
+                    "Sleep scoring error",
+                    f"Error loading sleep_state.pickle:\n{e}\n\nDo you want to rerun sleep scoring now?",
+                    QMessageBox.Yes | QMessageBox.No,
+                )
+                if reply == QMessageBox.Yes:
+                    sleep_state = self._run_sleep_scoring_for_current_ids()
+                    if sleep_state is None:
+                        return
+                else:
+                    QMessageBox.information(self, "Sleep scoring", "Load cancelled: sleep scoring data not available.")
+                    return
         else:
             reply = QMessageBox.question(
                 self,
@@ -399,17 +433,38 @@ class VideoAnalysisApp(QMainWindow):
                 QMessageBox.Yes | QMessageBox.No
             )
             if reply == QMessageBox.Yes:
-                try:
-                    sleep_state = run_sleep_scoring(self.userID, self.expID)
-                except Exception as e:
-                    QMessageBox.critical(self, "Sleep scoring error", f"Error running sleep scoring:\n{e}")
-                    return
+                sleep_state = self._run_sleep_scoring_for_current_ids()
                 if sleep_state is None:
-                    QMessageBox.critical(self, "Sleep scoring error", "run_sleep_scoring returned no data.")
                     return
             else:
                 QMessageBox.information(self, "Sleep scoring", "Load cancelled: sleep scoring data not available.")
                 return
+
+        ok, err_msg = self._validate_sleep_state_dict(sleep_state)
+        if not ok:
+            reply = QMessageBox.question(
+                self,
+                "Sleep scoring file outdated",
+                f"{err_msg}\nThis experiment needs to be rescored.\nRun sleep scoring now?",
+                QMessageBox.Yes | QMessageBox.No,
+            )
+            if reply == QMessageBox.Yes:
+                sleep_state = self._run_sleep_scoring_for_current_ids()
+                if sleep_state is None:
+                    return
+                ok, err_msg = self._validate_sleep_state_dict(sleep_state)
+                if not ok:
+                    QMessageBox.critical(
+                        self,
+                        "Sleep scoring error",
+                        f"Rescoring did not produce a valid data file:\n{err_msg}",
+                    )
+                    return
+            else:
+                QMessageBox.information(self, "Sleep scoring", "Load cancelled: incompatible data.")
+                return
+
+        self.sleep_state_path = sleep_state_path
 
         # 10 Hz traces
         self.emg_rms_10hz   = np.asarray(sleep_state['emg_rms_10hz'],   dtype=float)
@@ -470,6 +525,7 @@ class VideoAnalysisApp(QMainWindow):
                 self.state_label_map = dict(labels_obj)
             else:
                 self.state_label_map = {i: str(name) for i, name in enumerate(labels_obj)}
+        self.loaded_sleep_state = sleep_state
 
         # debug spans
         video_min = float(np.nanmin(self.eye_frame_times))
@@ -508,10 +564,13 @@ class VideoAnalysisApp(QMainWindow):
 
         self.satPercentEdit.setEnabled(True)
         self.locSdEdit.setEnabled(True)
-        self.thresholdEditCheck.setEnabled(True)
+        self.modeThresholdButton.setEnabled(True)
+        self.modeSelectionButton.setEnabled(True)
+        self.modeSelectionButton.setChecked(True)
         self.autoRescoreCheck.setEnabled(True)
         self.autoRescoreCheck.setChecked(False)
         self.rescoreButton.setEnabled(True)
+        self.saveButton.setEnabled(False)
 
         self.loaded = True
         self._state_dirty = False
@@ -519,8 +578,48 @@ class VideoAnalysisApp(QMainWindow):
         # Build epoch features for interactive reclassification
         self._rebuild_epoch_features()
 
+        self._refresh_state_controls()
+        self._update_save_button_state()
         self.updateFrame()
         self.plotTraces()
+
+    def _validate_sleep_state_dict(self, sleep_state):
+        required_keys = [
+            "emg_rms_10hz",
+            "emg_rms_10hz_t",
+            "wheel_10hz",
+            "wheel_10hz_t",
+            "eeg_10hz",
+            "eeg_10hz_t",
+            "state_epoch",
+            "state_epoch_t",
+            "state_10hz",
+            "state_10hz_t",
+            "epoch_t",
+            "theta_power",
+            "delta_power",
+            "epoch_features",
+        ]
+        for key in required_keys:
+            if key not in sleep_state:
+                return False, f"sleep_state.pickle is missing '{key}'."
+
+        epoch_features = sleep_state.get("epoch_features")
+        if not isinstance(epoch_features, dict) or not epoch_features:
+            return False, "sleep_state.pickle has no cached epoch features."
+
+        return True, ""
+
+    def _run_sleep_scoring_for_current_ids(self):
+        try:
+            sleep_state = run_sleep_scoring(self.userID, self.expID)
+        except Exception as e:
+            QMessageBox.critical(self, "Sleep scoring error", f"Error running sleep scoring:\n{e}")
+            return None
+        if sleep_state is None:
+            QMessageBox.critical(self, "Sleep scoring error", "run_sleep_scoring returned no data.")
+            return None
+        return sleep_state
 
     def runSleepScoringClicked(self):
         user_id = self.userIdEdit.text().strip()
@@ -691,10 +790,11 @@ class VideoAnalysisApp(QMainWindow):
             except Exception:
                 pass
         self.span_selectors = []
+        self.selection_patches = []
 
         def make_on_select(ax):
             def on_select(xmin, xmax):
-                if not self.loaded:
+                if not self.loaded or not self._selection_enabled():
                     return
                 self._set_selection_visual(ax, xmin, xmax)
             return on_select
@@ -708,21 +808,32 @@ class VideoAnalysisApp(QMainWindow):
                 interactive=True,
                 props=dict(alpha=0.15, facecolor='yellow')
             )
+            selector.set_active(self._selection_enabled())
             self.span_selectors.append(selector)
 
     def _set_selection_visual(self, ax, xmin, xmax):
+        if not self._selection_enabled():
+            return
         if xmin > xmax:
             xmin, xmax = xmax, xmin
+        self._clear_selection_visuals()
         self.selection_range = (float(xmin), float(xmax))
 
-        if self.selection_patch is not None:
-            try:
-                self.selection_patch.remove()
-            except Exception:
-                pass
-            self.selection_patch = None
+        patch = ax.axvspan(xmin, xmax, color='yellow', alpha=0.3)
+        self.selection_patch = patch
+        self.selection_patches = [patch]
 
-        self.selection_patch = ax.axvspan(xmin, xmax, color='yellow', alpha=0.3)
+        for selector in self.span_selectors:
+            if selector.ax is ax:
+                continue
+            artist = getattr(selector, "_selection_artist", None)
+            if artist is not None:
+                try:
+                    artist.remove()
+                except Exception:
+                    pass
+                selector._selection_artist = None
+
         self.canvas.draw_idle()
 
     # -----------------------------
@@ -880,6 +991,8 @@ class VideoAnalysisApp(QMainWindow):
     def assign_state_key(self, state_value: int):
         if not self.loaded or self.selection_range is None:
             return
+        if self.available_state_values and int(state_value) not in self.available_state_values:
+            return
         tmin, tmax = self.selection_range
 
         mask_epoch = (self.state_epoch_t >= tmin) & (self.state_epoch_t <= tmax)
@@ -888,15 +1001,11 @@ class VideoAnalysisApp(QMainWindow):
         mask_10 = (self.state_10hz_t >= tmin) & (self.state_10hz_t <= tmax)
         self.state_10hz[mask_10] = int(state_value)
 
-        if self.selection_patch is not None:
-            try:
-                self.selection_patch.remove()
-            except Exception:
-                pass
-            self.selection_patch = None
-        self.selection_range = None
+        self._clear_selection_visuals()
 
-        # Only update state plot (avoid full rebuild)
+        self._state_dirty = True
+        self._update_save_button_state()
+
         self._update_state_axis_only()
 
     def rerun_classification(self):
@@ -914,7 +1023,7 @@ class VideoAnalysisApp(QMainWindow):
             "delta_power_threshold": float(self.delta_power_threshold),
         }
         try:
-            state_epoch, resolved = score_from_epoch_features(
+            state_epoch, _ = score_from_epoch_features(
                 self.epoch_features_data,
                 thresholds=thresholds,
                 auto_thresholds=False,
@@ -922,11 +1031,6 @@ class VideoAnalysisApp(QMainWindow):
         except Exception as exc:
             QMessageBox.critical(self, "Rescore error", f"Error during rescoring:\n{exc}")
             return
-
-        self.emg_rms_threshold = float(resolved["emg_rms_threshold"])
-        self.wheel_speed_threshold = float(resolved["wheel_speed_threshold"])
-        self.theta_delta_ratio_threshold = float(resolved["theta_delta_ratio_threshold"])
-        self.delta_power_threshold = float(resolved["delta_power_threshold"])
 
         self.state_epoch = state_epoch.astype(np.int8)
 
@@ -939,23 +1043,60 @@ class VideoAnalysisApp(QMainWindow):
         )
         self.state_10hz = interp(self.state_10hz_t).astype(np.int8)
 
-        self._state_dirty = False
+        self._state_dirty = True
         self._sync_threshold_widgets_to_values()
         self._update_state_axis_only()
+        self._update_save_button_state()
 
     def onRescoreClicked(self):
         if not self.loaded:
             return
         self.rerun_classification()
 
+    def saveSleepScoring(self):
+        if not self.loaded:
+            return
+        if not self.sleep_state_path:
+            QMessageBox.warning(self, "Save error", "Sleep scoring path is unknown; load data first.")
+            return
+
+        sleep_state = dict(self.loaded_sleep_state) if isinstance(self.loaded_sleep_state, dict) else {}
+
+        sleep_state["state_epoch"] = np.asarray(self.state_epoch, dtype=np.int8)
+        sleep_state["state_epoch_t"] = np.asarray(self.state_epoch_t, dtype=np.float64)
+        sleep_state["state_10hz"] = np.asarray(self.state_10hz, dtype=np.int8)
+        sleep_state["state_10hz_t"] = np.asarray(self.state_10hz_t, dtype=np.float64)
+
+        sleep_state["emg_rms_threshold"] = float(self.emg_rms_threshold)
+        sleep_state["wheel_speed_threshold"] = float(self.wheel_speed_threshold)
+        sleep_state["theta_delta_ratio_threshold"] = float(self.theta_delta_ratio_threshold)
+        sleep_state["delta_power_threshold"] = float(self.delta_power_threshold)
+
+        if self.epoch_features_data is not None:
+            sleep_state["epoch_features"] = {
+                key: np.asarray(val)
+                for key, val in self.epoch_features_data.items()
+            }
+
+        try:
+            with open(self.sleep_state_path, "wb") as f:
+                pickle.dump(sleep_state, f)
+        except Exception as e:
+            QMessageBox.critical(self, "Save error", f"Failed to save sleep_state.pickle:\n{e}")
+            return
+
+        self.loaded_sleep_state = sleep_state
+        self._state_dirty = False
+        self._update_save_button_state()
+        QMessageBox.information(self, "Sleep scoring", "Updated sleep scoring data saved successfully.")
+
     # -----------------------------
     # Threshold widgets (drag + slider sync)
     # -----------------------------
     def _threshold_edit_enabled(self):
-        # Keep toolbar functionality but avoid fighting it:
-        # - threshold edit mode must be on
-        # - toolbar must not be in pan/zoom mode (best-effort)
-        if not self.thresholdEditCheck.isChecked():
+        if not self.modeThresholdButton.isEnabled():
+            return False
+        if not self.modeThresholdButton.isChecked():
             return False
         try:
             mode = getattr(self.toolbar, "mode", "")
@@ -969,12 +1110,110 @@ class VideoAnalysisApp(QMainWindow):
         return (
             self.autoRescoreCheck.isEnabled()
             and self.autoRescoreCheck.isChecked()
+            and self._threshold_edit_enabled()
         )
 
     def _handle_threshold_change(self):
         self._state_dirty = True
+        self._update_save_button_state()
         if self._auto_rescore_enabled():
             self.rerun_classification()
+
+    def _update_save_button_state(self):
+        if hasattr(self, "saveButton") and self.saveButton is not None:
+            self.saveButton.setEnabled(self.loaded and self._state_dirty)
+
+    def _selection_enabled(self):
+        return self.loaded and self.modeSelectionButton.isChecked()
+
+    def onModeToggled(self, *_):
+        selection_active = self._selection_enabled()
+        for selector in self.span_selectors:
+            try:
+                selector.set_active(selection_active)
+            except Exception:
+                pass
+        if not selection_active:
+            self._clear_selection_visuals()
+        slider_active = self._threshold_edit_enabled()
+        for slider in [self._slider_emg, self._slider_wheel, self._slider_ratio]:
+            if slider is not None:
+                try:
+                    slider.set_active(slider_active)
+                except Exception:
+                    pass
+
+    def _clear_selection_visuals(self):
+        if self.selection_patches:
+            for patch in self.selection_patches:
+                try:
+                    patch.remove()
+                except Exception:
+                    pass
+        self.selection_patches = []
+        if self.selection_patch is not None:
+            try:
+                self.selection_patch.remove()
+            except Exception:
+                pass
+            self.selection_patch = None
+        self.selection_range = None
+        if hasattr(self, "canvas") and self.canvas is not None:
+            self.canvas.draw_idle()
+
+    def _clear_layout(self, layout):
+        while layout.count():
+            item = layout.takeAt(0)
+            widget = item.widget()
+            child_layout = item.layout()
+            if widget is not None:
+                widget.deleteLater()
+            elif child_layout is not None:
+                self._clear_layout(child_layout)
+
+    def _refresh_state_controls(self):
+        self._clear_layout(self.stateButtonsLayout)
+        self.state_buttons = []
+        for sc in self.state_shortcuts:
+            try:
+                sc.activated.disconnect()
+            except Exception:
+                pass
+            sc.setParent(None)
+        self.state_shortcuts = []
+        self.state_shortcut_map = {}
+        self.available_state_values = set()
+
+        if not self.loaded:
+            return
+
+        if self.state_label_map:
+            keys = sorted(int(k) for k in self.state_label_map.keys())
+            state_items = []
+            for key in keys:
+                label = self.state_label_map.get(key)
+                if label is None:
+                    label = self.state_label_map.get(str(key), f"State {key}")
+                state_items.append((key, label))
+        else:
+            unique_states = np.unique(self.state_epoch) if hasattr(self, "state_epoch") else []
+            state_items = [(int(val), f"State {int(val)}") for val in unique_states]
+            if not state_items:
+                state_items = [(0, "State 0")]
+
+        self.available_state_values = {state_id for state_id, _ in state_items}
+
+        for idx, (state_id, label) in enumerate(state_items):
+            btn = QPushButton(f"{idx}: {label}")
+            btn.clicked.connect(lambda _, sid=state_id: self.assign_state_key(sid))
+            self.stateButtonsLayout.addWidget(btn)
+            self.state_buttons.append(btn)
+
+            shortcut_key = str(idx)
+            shortcut = QtWidgets.QShortcut(QtGui.QKeySequence(shortcut_key), self)
+            shortcut.activated.connect(lambda sid=state_id: self.assign_state_key(sid))
+            self.state_shortcuts.append(shortcut)
+            self.state_shortcut_map[shortcut_key] = state_id
 
     def _sync_threshold_widgets_to_values(self):
         if (
@@ -1044,31 +1283,30 @@ class VideoAnalysisApp(QMainWindow):
             emg_vals = np.asarray(self.emg_rms_10hz, dtype=float)
         emg_finite = emg_vals[np.isfinite(emg_vals)]
         if emg_finite.size > 0:
-            emg_min = float(np.percentile(emg_finite, 1))
-            emg_max = float(np.percentile(emg_finite, 99))
+            emg_max = float(np.nanmax(emg_finite))
         else:
-            emg_min, emg_max = 0.0, max(1.0, float(self.emg_rms_threshold) * 2.0)
-        if emg_min == emg_max:
-            emg_max = emg_min + 1e-6
+            emg_max = max(1.0, float(self.emg_rms_threshold))
+        emg_min = 0.0
+        emg_max = max(emg_max * 1.05, emg_min + 1e-6)
 
         wheel_vals = self.wheel_speed_mean_by_epoch
         if wheel_vals is None:
             wheel_vals = np.asarray(self.wheel_10hz, dtype=float)
         wheel_finite = wheel_vals[np.isfinite(wheel_vals)]
-        wheel_max = float(np.percentile(np.abs(wheel_finite), 99)) if wheel_finite.size else 5.0
-        wheel_max = max(wheel_max, 0.1)
+        if wheel_finite.size > 0:
+            wheel_max = float(np.nanmax(np.abs(wheel_finite)))
+        else:
+            wheel_max = max(0.1, abs(float(self.wheel_speed_threshold)))
+        wheel_max = max(wheel_max * 1.05, 0.1)
 
         ratio_vals = np.asarray(self.theta_delta_ratio_smoothed, dtype=float)
         ratio_finite = ratio_vals[np.isfinite(ratio_vals)]
         if ratio_finite.size > 0:
-            ratio_min = float(np.percentile(ratio_finite, 1))
-            ratio_max = float(np.percentile(ratio_finite, 99))
+            ratio_max = float(np.nanmax(ratio_finite))
         else:
-            ratio_min, ratio_max = 0.0, 5.0
-        ratio_min = min(ratio_min, float(self.theta_delta_ratio_threshold) * 0.5)
-        ratio_max = max(ratio_max, float(self.theta_delta_ratio_threshold) * 1.5)
-        if ratio_min == ratio_max:
-            ratio_max = ratio_min + 1e-6
+            ratio_max = max(1.0, float(self.theta_delta_ratio_threshold))
+        ratio_min = 0.0
+        ratio_max = max(ratio_max * 1.05, ratio_min + 1e-6)
 
         # --- Drag callbacks (update slider + rerun classification) ---
         def on_emg_drag(y):
@@ -1145,34 +1383,73 @@ class VideoAnalysisApp(QMainWindow):
         def on_emg_slider(val):
             if self._syncing_slider:
                 return
+            if not self._threshold_edit_enabled():
+                self._syncing_slider = True
+                try:
+                    if self._slider_emg is not None:
+                        self._slider_emg.set_val(float(self.emg_rms_threshold))
+                finally:
+                    self._syncing_slider = False
+                return
             self._syncing_slider = True
             try:
-                self._thr_drag_emg.set_y(float(val), trigger_callback=True)
+                new_val = float(val)
+                self.emg_rms_threshold = new_val
+                if self._thr_drag_emg is not None:
+                    self._thr_drag_emg.set_y(new_val, trigger_callback=False)
             finally:
                 self._syncing_slider = False
+            self._handle_threshold_change()
 
         def on_wheel_slider(val):
             if self._syncing_slider:
                 return
+            if not self._threshold_edit_enabled():
+                self._syncing_slider = True
+                try:
+                    if self._slider_wheel is not None:
+                        self._slider_wheel.set_val(float(self.wheel_speed_threshold))
+                finally:
+                    self._syncing_slider = False
+                return
             self._syncing_slider = True
             try:
-                self._thr_drag_wheel.set_y(float(val), trigger_callback=True)
+                new_val = float(val)
+                self.wheel_speed_threshold = new_val
+                if self._thr_drag_wheel is not None:
+                    self._thr_drag_wheel.set_y(new_val, trigger_callback=False)
             finally:
                 self._syncing_slider = False
+            self._handle_threshold_change()
 
         def on_ratio_slider(val):
             if self._syncing_slider:
                 return
+            if not self._threshold_edit_enabled():
+                self._syncing_slider = True
+                try:
+                    if self._slider_ratio is not None:
+                        self._slider_ratio.set_val(float(self.theta_delta_ratio_threshold))
+                finally:
+                    self._syncing_slider = False
+                return
             self._syncing_slider = True
             try:
-                self._thr_drag_ratio.set_y(float(val), trigger_callback=True)
+                new_val = float(val)
+                self.theta_delta_ratio_threshold = new_val
+                if self._thr_drag_ratio is not None:
+                    self._thr_drag_ratio.set_y(new_val, trigger_callback=False)
             finally:
                 self._syncing_slider = False
+            self._handle_threshold_change()
 
         # Create sliders
-        self._slider_emg = Slider(ax_s_emg, "EMG thr", emg_min, emg_max, valinit=float(self.emg_rms_threshold))
-        self._slider_wheel = Slider(ax_s_wheel, "Wheel thr", 0.0, wheel_max, valinit=float(self.wheel_speed_threshold))
-        self._slider_ratio = Slider(ax_s_ratio, "θ/δ thr", ratio_min, ratio_max, valinit=float(self.theta_delta_ratio_threshold))
+        self._slider_emg = Slider(ax_s_emg, "", emg_min, emg_max, valinit=float(self.emg_rms_threshold))
+        ax_s_emg.set_title("EMG thr", fontsize=9)
+        self._slider_wheel = Slider(ax_s_wheel, "", 0.0, wheel_max, valinit=float(self.wheel_speed_threshold))
+        ax_s_wheel.set_title("Wheel thr", fontsize=9)
+        self._slider_ratio = Slider(ax_s_ratio, "", ratio_min, ratio_max, valinit=float(self.theta_delta_ratio_threshold))
+        ax_s_ratio.set_title("θ/δ thr", fontsize=9)
 
         self._slider_emg.on_changed(on_emg_slider)
         self._slider_wheel.on_changed(on_wheel_slider)
@@ -1217,8 +1494,8 @@ class VideoAnalysisApp(QMainWindow):
         self.figure.clear()
 
         axs = self.figure.subplots(
-            6, 1, sharex=True,
-            gridspec_kw={'height_ratios': [1, 1, 3, 1, 1, 1]}
+            7, 1, sharex=True,
+            gridspec_kw={'height_ratios': [1, 1, 1, 3, 1, 1, 1]}
         )
         self._axs = axs
 
@@ -1226,7 +1503,7 @@ class VideoAnalysisApp(QMainWindow):
         emg_color = 'tab:blue'
         wheel_color = 'tab:orange'
 
-        # 1) EMG RMS + wheel (twin axes)
+        # 1) EMG RMS
         ax1 = axs[0]
         ax1.plot(self.emg_rms_10hz_t, self.emg_rms_10hz, color=emg_color, label="EMG RMS")
         ax1.set_ylabel("EMG RMS", color=emg_color)
@@ -1236,23 +1513,26 @@ class VideoAnalysisApp(QMainWindow):
         ax1.tick_params(axis='x', labelbottom=False)
         ax1.spines['left'].set_color(emg_color)
 
-        ax1b = ax1.twinx()
-        ax1b.plot(self.wheel_10hz_t, self.wheel_10hz, color=wheel_color, label="Wheel")
-        ax1b.set_ylabel("Wheel", color=wheel_color)
-        ax1b.spines['top'].set_visible(False)
-        ax1b.tick_params(axis='y', labelcolor=wheel_color)
-        ax1b.spines['right'].set_color(wheel_color)
-
-        # 2) EEG 10 Hz
+        # 2) Wheel
         ax2 = axs[1]
-        ax2.plot(self.eeg_10hz_t, self.eeg_10hz)
-        ax2.set_ylabel("EEG (10 Hz)")
+        ax2.plot(self.wheel_10hz_t, self.wheel_10hz, color=wheel_color, label="Wheel")
+        ax2.set_ylabel("Wheel", color=wheel_color)
         ax2.spines['top'].set_visible(False)
         ax2.spines['right'].set_visible(False)
+        ax2.tick_params(axis='y', labelcolor=wheel_color)
+        ax2.spines['left'].set_color(wheel_color)
         ax2.tick_params(axis='x', labelbottom=False)
 
-        # 3) EEG spectrogram, 0–20 Hz, saturation, pixelated
+        # 3) EEG 10 Hz
         ax3 = axs[2]
+        ax3.plot(self.eeg_10hz_t, self.eeg_10hz)
+        ax3.set_ylabel("EEG (10 Hz)")
+        ax3.spines['top'].set_visible(False)
+        ax3.spines['right'].set_visible(False)
+        ax3.tick_params(axis='x', labelbottom=False)
+
+        # 4) EEG spectrogram, 0–20 Hz, saturation, pixelated
+        ax4 = axs[3]
         max_freq = 20.0
         if (
             self.eeg_spectrogram.size > 0 and
@@ -1290,51 +1570,51 @@ class VideoAnalysisApp(QMainWindow):
                     im_args["vmin"] = vmin
                     im_args["vmax"] = vmax
 
-                ax3.imshow(spec_band, **im_args)
-                ax3.set_ylim(0, max_freq)
+                ax4.imshow(spec_band, **im_args)
+                ax4.set_ylim(0, max_freq)
 
         for y in [1.0, 4.0, 8.0]:
-            ax3.axhline(y=y, color='white', linestyle=':', linewidth=1)
+            ax4.axhline(y=y, color='white', linestyle=':', linewidth=1)
 
-        ax3.set_ylabel("Freq (Hz)")
-        ax3.spines['top'].set_visible(False)
-        ax3.spines['right'].set_visible(False)
-        ax3.tick_params(axis='x', labelbottom=False)
-
-        # 4) Theta + Delta (z-scored)
-        ax4 = axs[3]
-        ax4.plot(self.epoch_t, theta_z, label="Theta (z)")
-        ax4.plot(self.epoch_t, delta_z, label="Delta (z)")
-        ax4.set_ylabel("Power (z)")
+        ax4.set_ylabel("Freq (Hz)")
         ax4.spines['top'].set_visible(False)
         ax4.spines['right'].set_visible(False)
         ax4.tick_params(axis='x', labelbottom=False)
-        ax4.legend(loc="upper right")
-        if delta_thr_z is not None:
-            ax4.axhline(delta_thr_z, color='r', linestyle='--', linewidth=1)
 
-        # 5) Ratio plot (label kept as Δ/Θ, but value is theta/delta as in your current GUI)
+        # 5) Theta + Delta (z-scored)
         ax5 = axs[4]
-        ax5.plot(self.epoch_t, ratio_masked)
-        ax5.set_ylabel("Δ/Θ")
+        ax5.plot(self.epoch_t, theta_z, label="Theta (z)")
+        ax5.plot(self.epoch_t, delta_z, label="Delta (z)")
+        ax5.set_ylabel("Power (z)")
         ax5.spines['top'].set_visible(False)
         ax5.spines['right'].set_visible(False)
         ax5.tick_params(axis='x', labelbottom=False)
+        ax5.legend(loc="upper right")
+        if delta_thr_z is not None:
+            ax5.axhline(delta_thr_z, color='r', linestyle='--', linewidth=1)
 
-        # 6) State axis (epoch-level)
+        # 6) Ratio plot
         ax6 = axs[5]
-        ax6.set_ylabel("State")
-        ax6.set_xlabel("Time (s)")
+        ax6.plot(self.epoch_t, ratio_masked)
+        ax6.set_ylabel("Δ/Θ")
         ax6.spines['top'].set_visible(False)
         ax6.spines['right'].set_visible(False)
+        ax6.tick_params(axis='x', labelbottom=False)
+
+        # 7) State axis (epoch-level)
+        ax7 = axs[6]
+        ax7.set_ylabel("State")
+        ax7.set_xlabel("Time (s)")
+        ax7.spines['top'].set_visible(False)
+        ax7.spines['right'].set_visible(False)
 
         self._ax_emg = ax1
-        self._ax_wheel = ax1b
-        self._ax_ratio = ax5
-        self._ax_state = ax6
+        self._ax_wheel = ax2
+        self._ax_ratio = ax6
+        self._ax_state = ax7
 
         # Draw state once (from current arrays)
-        self._draw_state_axis(ax6)
+        self._draw_state_axis(ax7)
 
         # Vertical lines
         self.vlines = []
@@ -1347,6 +1627,7 @@ class VideoAnalysisApp(QMainWindow):
 
         # Threshold widgets (draggable lines + sliders)
         self._setup_threshold_widgets()
+        self.onModeToggled()
 
         self.canvas.draw()
 

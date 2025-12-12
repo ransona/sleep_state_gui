@@ -332,12 +332,12 @@ def score_from_epoch_features(
     if auto_thresholds or thresholds is None:
         resolved = auto_vals
     else:
-        resolved = auto_vals.copy()
-        for key, val in thresholds.items():
-            if val is None:
-                continue
-            if key in resolved:
-                resolved[key] = float(val)
+        resolved = {}
+        for key, auto_val in auto_vals.items():
+            if thresholds is not None and key in thresholds and thresholds[key] is not None:
+                resolved[key] = float(thresholds[key])
+            else:
+                resolved[key] = auto_val
 
     emg = _as_float_array(epoch_features["emg_rms_mean"])
     wheel = _as_float_array(epoch_features["wheel_speed_mean"])
