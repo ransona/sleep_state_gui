@@ -2,6 +2,7 @@ import os
 import time
 import pickle
 
+import cv2
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -63,6 +64,9 @@ STATE_LABELS = {
     STATE_NREM: "nrem",
     STATE_REM: "rem",
 }
+
+DEFAULT_DELTA_BAND = (1.0, 10.0)
+DEFAULT_THETA_BAND = (5.0, 10.0)
 
 
 # ---------------------------------------------------------------------
@@ -203,6 +207,114 @@ def epoch_total_power(signal_epochs, fs):
             print(f"\r    progress (power): {progress:5.1f}%", end="")
     print()
     return power
+
+
+def _validate_band(band, name, fs):
+    if band is None:
+        return None
+    if len(band) != 2:
+        raise ValueError(f"{name} must be a pair (low, high)")
+    low, high = float(band[0]), float(band[1])
+    if not np.isfinite(low) or not np.isfinite(high):
+        raise ValueError(f"{name} values must be finite")
+    if low <= 0 or high <= 0:
+        raise ValueError(f"{name} values must be positive")
+    if high <= low:
+        raise ValueError(f"{name} high must be greater than low")
+    if high >= fs / 2:
+        raise ValueError(f"{name} high must be less than Nyquist ({fs/2:.1f} Hz)")
+    return (low, high)
+
+
+def _report_progress(callback, step_idx, total_steps, message):
+    if callback is None:
+        return
+    try:
+        fraction = float(step_idx) / float(total_steps)
+    except Exception:
+        fraction = 0.0
+    try:
+        callback(fraction, str(message))
+    except Exception:
+        pass
+
+
+def _compute_face_motion_series(video_path, max_frames=None):
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        print(f"  - face motion: unable to open video {video_path}")
+        return None
+
+    diffs = []
+    prev_gray = None
+    frame_count = 0
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        if prev_gray is None:
+            diffs.append(0.0)
+        else:
+            diff = cv2.absdiff(gray, prev_gray)
+            diffs.append(float(np.sum(diff)))
+        prev_gray = gray
+
+        frame_count += 1
+        if max_frames is not None and frame_count >= max_frames:
+            break
+
+    cap.release()
+    if not diffs:
+        return None
+    return np.asarray(diffs, dtype=float)
+
+
+def _load_or_compute_face_motion(exp_dir_processed, exp_id, sleep_score_folder):
+    cache_path = os.path.join(sleep_score_folder, "face_motion.npy")
+    recordings_dir = os.path.join(exp_dir_processed, "recordings")
+    eye_times_path = os.path.join(recordings_dir, "eye_frame_times.npy")
+    video_path = os.path.join(exp_dir_processed, f"{exp_id}_eye1_left.avi")
+
+    if not os.path.isfile(eye_times_path):
+        print("  - face motion: eye_frame_times.npy not found, skipping motion metric")
+        return None, None
+    try:
+        eye_times = np.load(eye_times_path).astype(float)
+    except Exception as exc:
+        print(f"  - face motion: unable to load eye_frame_times.npy ({exc}), skipping")
+        return None, None
+
+    if os.path.isfile(cache_path):
+        try:
+            cached = np.load(cache_path, allow_pickle=True).item()
+            motion = np.asarray(cached.get("motion"), dtype=float)
+            motion_t = np.asarray(cached.get("t"), dtype=float)
+            if motion.size > 0 and motion_t.size == motion.size:
+                return motion_t, motion
+        except Exception:
+            print("  - face motion: cached file unavailable, recomputing")
+
+    if not os.path.isfile(video_path):
+        print(f"  - face motion: video {video_path} not found, skipping")
+        return None, None
+
+    max_frames = int(eye_times.size)
+    motion = _compute_face_motion_series(video_path, max_frames=max_frames)
+    if motion is None:
+        return None, None
+
+    if motion.size != eye_times.size:
+        n = min(motion.size, eye_times.size)
+        motion = motion[:n]
+        eye_times = eye_times[:n]
+
+    try:
+        np.save(cache_path, {"t": eye_times, "motion": motion})
+    except Exception as exc:
+        print(f"  - face motion: warning, unable to save cache ({exc})")
+    return eye_times, motion
 
 
 # ---------------------------------------------------------------------
@@ -395,7 +507,6 @@ def make_qc_figures(
     ax[1].set_title("emg_rms (1 s window)")
     fig.suptitle("sanity check emg & rms", fontsize=16)
     fig.tight_layout()
-    plt.show()
     fig.savefig(os.path.join(figs_folder, "01_sanity_emg_rms.png"))
     plt.close(fig)
 
@@ -457,7 +568,14 @@ def make_qc_figures(
 # main processing function (callable from GUI)
 # ---------------------------------------------------------------------
 
-def run_sleep_scoring(user_id, exp_id):
+def run_sleep_scoring(
+    user_id,
+    exp_id,
+    *,
+    delta_band=None,
+    theta_band=None,
+    progress_callback=None,
+):
     """
     Sleep scoring pipeline.
 
@@ -467,6 +585,12 @@ def run_sleep_scoring(user_id, exp_id):
         User / subject identifier, passed to organise_paths.find_paths.
     exp_id : str
         Experiment ID string.
+    delta_band : tuple(float, float), optional
+        Delta band passband (Hz). Defaults to DEFAULT_DELTA_BAND.
+    theta_band : tuple(float, float), optional
+        Theta band passband (Hz). Defaults to DEFAULT_THETA_BAND.
+    progress_callback : callable, optional
+        Invoked as progress_callback(fraction, message) as the pipeline advances.
 
     Returns
     -------
@@ -478,13 +602,19 @@ def run_sleep_scoring(user_id, exp_id):
         - state classification (per epoch and 10 Hz)
         - thresholds used for classification
         - epoch_features dict for quick rescoring
+        - delta/theta band metadata
     """
     start_time = time.time()
+    total_steps = 13
+    step_idx = 0
+    _report_progress(progress_callback, step_idx, total_steps, "Starting sleep scoring")
     print(f"starting sleep scoring for user_id={user_id}, exp_id={exp_id}")
 
     # -------------------------------------------------------------
     # 1. paths and loading
     # -------------------------------------------------------------
+    step_idx += 1
+    _report_progress(progress_callback, step_idx, total_steps, "Locating paths and loading data")
     print("[1/9] locating paths and loading data")
     animal_id, _, _, exp_dir_processed, _ = organise_paths.find_paths(user_id, exp_id)
 
@@ -503,15 +633,26 @@ def run_sleep_scoring(user_id, exp_id):
 
     print(f"  - ephys length: {len(t_ephys)} samples")
 
+    if delta_band is None:
+        delta_band = DEFAULT_DELTA_BAND
+    if theta_band is None:
+        theta_band = DEFAULT_THETA_BAND
+    delta_band = _validate_band(delta_band, "delta_band", fs)
+    theta_band = _validate_band(theta_band, "theta_band", fs)
+
     # -------------------------------------------------------------
     # 2. filter eeg and emg
     # -------------------------------------------------------------
+    step_idx += 1
+    _report_progress(progress_callback, step_idx, total_steps, "Filtering EEG and EMG")
     print("[2/9] filtering eeg and emg")
     eeg_filtered, emg_filtered = apply_eeg_emg_filters(eeg_raw, emg_raw, fs)
 
     # -------------------------------------------------------------
     # 3. emg rms (1 s window), aligned to full length
     # -------------------------------------------------------------
+    step_idx += 1
+    _report_progress(progress_callback, step_idx, total_steps, "Computing EMG RMS (1 s window)")
     print("[3/9] computing emg rms (1 s window)")
     rms_window = int(RMS_WINDOW_SEC * fs)
     emg_rms = moving_rms(emg_filtered, rms_window)
@@ -520,15 +661,22 @@ def run_sleep_scoring(user_id, exp_id):
     # -------------------------------------------------------------
     # 4. eeg band-pass into delta and theta
     # -------------------------------------------------------------
-    print("[4/9] band-pass filtering eeg into delta and theta")
-    delta_b = butter(2, [1, 10], btype="bandpass", fs=fs)
-    theta_b = butter(2, [5, 10], btype="bandpass", fs=fs)
+    step_idx += 1
+    _report_progress(progress_callback, step_idx, total_steps, "Filtering EEG into delta/theta bands")
+    print(
+        f"[4/9] band-pass filtering eeg into delta ({delta_band[0]:.2f}-{delta_band[1]:.2f} Hz) "
+        f"and theta ({theta_band[0]:.2f}-{theta_band[1]:.2f} Hz)"
+    )
+    delta_b = butter(2, delta_band, btype="bandpass", fs=fs)
+    theta_b = butter(2, theta_band, btype="bandpass", fs=fs)
     eeg_delta = filtfilt(delta_b[0], delta_b[1], eeg_filtered)
     eeg_theta = filtfilt(theta_b[0], theta_b[1], eeg_filtered)
 
     # -------------------------------------------------------------
     # 5. moving-window EEG spectrogram (5 s window, 2 s stride)
     # -------------------------------------------------------------
+    step_idx += 1
+    _report_progress(progress_callback, step_idx, total_steps, "Computing EEG spectrogram")
     print("[5/9] computing eeg spectrogram (5 s window, 2 s stride)")
     spec_nperseg = int(SPEC_WINDOW_SEC * fs)
     spec_step = int(SPEC_STRIDE_SEC * fs)
@@ -550,6 +698,8 @@ def run_sleep_scoring(user_id, exp_id):
     # -------------------------------------------------------------
     # 6. resample wheel speed to ephys time base
     # -------------------------------------------------------------
+    step_idx += 1
+    _report_progress(progress_callback, step_idx, total_steps, "Resampling wheel speed")
     print("[6/9] resampling wheel speed to ephys time base")
     wheel_speed_raw = wheel_df["speed"]
     wheel_t = wheel_df["t"]
@@ -559,6 +709,8 @@ def run_sleep_scoring(user_id, exp_id):
     # -------------------------------------------------------------
     # 7. epoching (10 s epochs) and epoch-level features
     # -------------------------------------------------------------
+    step_idx += 1
+    _report_progress(progress_callback, step_idx, total_steps, "Epoching signals (10 s)")
     print("[7/9] epoching signals (10 s epochs)")
 
     n_samples = len(eeg_theta)
@@ -582,6 +734,8 @@ def run_sleep_scoring(user_id, exp_id):
     start_time_ephys = t_ephys[0]
     epoch_time = start_time_ephys + (np.arange(n_epochs) + 0.5) * EPOCH_LEN_SEC
 
+    step_idx += 1
+    _report_progress(progress_callback, step_idx, total_steps, "Computing epoch-level power features")
     print("[8/9] computing epoch-wise power features")
     theta_power_epochs = epoch_total_power(eeg_theta_epochs, fs)
     delta_power_epochs = epoch_total_power(eeg_delta_epochs, fs)
@@ -593,6 +747,8 @@ def run_sleep_scoring(user_id, exp_id):
     # -------------------------------------------------------------
     # 8. thresholds and state classification
     # -------------------------------------------------------------
+    step_idx += 1
+    _report_progress(progress_callback, step_idx, total_steps, "Classifying sleep states")
     print("[9/9] estimating thresholds and classifying states")
     emg_rms_mean_by_epoch = emg_rms_epochs.mean(axis=1)
     wheel_speed_mean_by_epoch = wheel_speed_epochs.mean(axis=1)
@@ -626,6 +782,8 @@ def run_sleep_scoring(user_id, exp_id):
     # -------------------------------------------------------------
     # 9. downsample to 10 Hz and interpolate states
     # -------------------------------------------------------------
+    step_idx += 1
+    _report_progress(progress_callback, step_idx, total_steps, "Downsampling to 10 Hz")
     print("downsampling signals to 10 hz")
     eeg_10hz, t_10hz = downsample_to_target_fs(eeg_filtered, fs, TARGET_FS, t=t_ephys)
     emg_10hz, _ = downsample_to_target_fs(emg_filtered, fs, TARGET_FS, t=t_ephys)
@@ -642,9 +800,37 @@ def run_sleep_scoring(user_id, exp_id):
     )
     state_10hz = state_interp_fun(t_10hz).astype(np.int8)
 
+    step_idx += 1
+    _report_progress(progress_callback, step_idx, total_steps, "Computing face motion metric")
+    face_motion_10hz = np.full(t_10hz.shape, np.nan, dtype=np.float32)
+    try:
+        face_motion_t, face_motion_vals = _load_or_compute_face_motion(
+            exp_dir_processed,
+            exp_id,
+            sleep_score_folder,
+        )
+        if (
+            face_motion_vals is not None
+            and face_motion_t is not None
+            and face_motion_vals.size > 0
+            and face_motion_t.size > 0
+        ):
+            interp_motion = interp1d(
+                face_motion_t,
+                face_motion_vals,
+                kind="nearest",
+                bounds_error=False,
+                fill_value=np.nan,
+            )
+            face_motion_10hz = interp_motion(t_10hz).astype(np.float32)
+    except Exception as exc:
+        print(f"  - face motion: unable to compute ({exc})")
+
     # -------------------------------------------------------------
     # 10. build output structure and save
     # -------------------------------------------------------------
+    step_idx += 1
+    _report_progress(progress_callback, step_idx, total_steps, "Building output structures")
     print("building output structures")
     epoch_time_s = epoch_time.astype(float)
 
@@ -665,6 +851,8 @@ def run_sleep_scoring(user_id, exp_id):
         "eeg_10hz_t": t_10hz.astype(np.float64),
         "wheel_10hz": wheel_10hz.astype(np.float32),
         "wheel_10hz_t": t_10hz.astype(np.float64),
+        "face_motion_10hz": face_motion_10hz.astype(np.float32),
+        "face_motion_10hz_t": t_10hz.astype(np.float64),
 
         # epoch-level features
         "epoch_t": epoch_time_s,
@@ -694,8 +882,12 @@ def run_sleep_scoring(user_id, exp_id):
             key: np.asarray(val)
             for key, val in epoch_features.items()
         },
+        "delta_band": tuple(delta_band),
+        "theta_band": tuple(theta_band),
     }
 
+    step_idx += 1
+    _report_progress(progress_callback, step_idx, total_steps, "Saving outputs")
     print("saving outputs")
     sleep_state_path = os.path.join(sleep_score_folder, "sleep_state.pickle")
     with open(sleep_state_path, "wb") as f:
@@ -723,6 +915,7 @@ def run_sleep_scoring(user_id, exp_id):
         )
 
     duration = time.time() - start_time
+    _report_progress(progress_callback, total_steps, total_steps, "Sleep scoring complete")
     print(f"done. scoring complete in {duration:.2f} s")
     print(f"  sleep_state: {sleep_state_path}")
 

@@ -9,7 +9,7 @@ from PyQt5 import QtWidgets, QtCore, QtGui
 from PyQt5.QtWidgets import (
     QMainWindow, QApplication, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QPushButton, QLineEdit, QSlider, QMessageBox, QSizePolicy,
-    QCheckBox, QRadioButton, QButtonGroup
+    QCheckBox, QRadioButton, QButtonGroup, QProgressBar
 )
 from PyQt5.QtCore import Qt, QTimer
 
@@ -25,6 +25,8 @@ from sleep_score import (
     run_sleep_scoring,
     score_from_epoch_features,
     build_epoch_feature_dict,
+    DEFAULT_DELTA_BAND,
+    DEFAULT_THETA_BAND,
 )
 
 
@@ -132,6 +134,30 @@ class DraggableHLine:
         self._dragging = False
 
 
+class ScoringProgressDialog(QtWidgets.QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Sleep scoring")
+        self.setModal(True)
+        layout = QVBoxLayout()
+        self.statusLabel = QLabel("Starting…")
+        self.progressBar = QProgressBar()
+        self.progressBar.setRange(0, 100)
+        layout.addWidget(self.statusLabel)
+        layout.addWidget(self.progressBar)
+        self.setLayout(layout)
+        self.resize(360, 120)
+
+    def update_progress(self, fraction, message):
+        try:
+            frac = float(fraction)
+        except Exception:
+            frac = 0.0
+        frac = min(max(frac, 0.0), 1.0)
+        self.statusLabel.setText(str(message))
+        self.progressBar.setValue(int(round(frac * 100)))
+        QApplication.processEvents()
+
 # -----------------------------
 # GUI
 # -----------------------------
@@ -163,6 +189,10 @@ class VideoAnalysisApp(QMainWindow):
 
         # eye frame times
         self.eye_frame_times = None
+        self.face_motion_10hz = None
+        self.face_motion_10hz_t = None
+        self.show_eye_videos = True
+        self.show_pupil_overlay = True
 
         # cached epoch features for rescoring
         self.epoch_features_data = None
@@ -171,6 +201,8 @@ class VideoAnalysisApp(QMainWindow):
         self._state_dirty = False
         self.selection_patches = []
         self.available_state_values = set()
+        self.delta_band = DEFAULT_DELTA_BAND
+        self.theta_band = DEFAULT_THETA_BAND
 
         # Matplotlib widgets/objects
         self.figure = None
@@ -270,6 +302,21 @@ class VideoAnalysisApp(QMainWindow):
         videoLayout.addWidget(self.rightVideoLabel)
         mainLayout.addLayout(videoLayout)
 
+        videoOptionsLayout = QHBoxLayout()
+        self.showVideosCheck = QCheckBox("Show eye videos")
+        self.showVideosCheck.setChecked(True)
+        self.showVideosCheck.setEnabled(False)
+        self.showVideosCheck.toggled.connect(self.onShowVideosToggled)
+        videoOptionsLayout.addWidget(self.showVideosCheck)
+
+        self.showOverlayCheck = QCheckBox("Show pupil overlay")
+        self.showOverlayCheck.setChecked(True)
+        self.showOverlayCheck.setEnabled(False)
+        self.showOverlayCheck.toggled.connect(self.onOverlayToggled)
+        videoOptionsLayout.addWidget(self.showOverlayCheck)
+        videoOptionsLayout.addStretch(1)
+        mainLayout.addLayout(videoOptionsLayout)
+
         # --- Spectrogram saturation + locomotion SD controls + threshold edit toggle ---
         satLayout = QHBoxLayout()
         satLayout.addWidget(QLabel("Spectrogram saturation (% in 0–20 Hz):"))
@@ -318,6 +365,33 @@ class VideoAnalysisApp(QMainWindow):
 
         satLayout.addStretch(1)
         mainLayout.addLayout(satLayout)
+
+        # --- Delta/Theta band controls ---
+        bandLayout = QHBoxLayout()
+        bandLayout.addWidget(QLabel("Delta band (Hz):"))
+        self.deltaBandLowEdit = QLineEdit(f"{DEFAULT_DELTA_BAND[0]:.1f}")
+        self.deltaBandLowEdit.setFixedWidth(60)
+        self.deltaBandLowEdit.setEnabled(False)
+        self.deltaBandHighEdit = QLineEdit(f"{DEFAULT_DELTA_BAND[1]:.1f}")
+        self.deltaBandHighEdit.setFixedWidth(60)
+        self.deltaBandHighEdit.setEnabled(False)
+        bandLayout.addWidget(self.deltaBandLowEdit)
+        bandLayout.addWidget(QLabel("to"))
+        bandLayout.addWidget(self.deltaBandHighEdit)
+
+        bandLayout.addSpacing(20)
+        bandLayout.addWidget(QLabel("Theta band (Hz):"))
+        self.thetaBandLowEdit = QLineEdit(f"{DEFAULT_THETA_BAND[0]:.1f}")
+        self.thetaBandLowEdit.setFixedWidth(60)
+        self.thetaBandLowEdit.setEnabled(False)
+        self.thetaBandHighEdit = QLineEdit(f"{DEFAULT_THETA_BAND[1]:.1f}")
+        self.thetaBandHighEdit.setFixedWidth(60)
+        self.thetaBandHighEdit.setEnabled(False)
+        bandLayout.addWidget(self.thetaBandLowEdit)
+        bandLayout.addWidget(QLabel("to"))
+        bandLayout.addWidget(self.thetaBandHighEdit)
+        bandLayout.addStretch(1)
+        mainLayout.addLayout(bandLayout)
 
         # --- State assignment controls (buttons + shortcuts) ---
         stateAssignLayout = QHBoxLayout()
@@ -419,7 +493,14 @@ class VideoAnalysisApp(QMainWindow):
                     QMessageBox.Yes | QMessageBox.No,
                 )
                 if reply == QMessageBox.Yes:
-                    sleep_state = self._run_sleep_scoring_for_current_ids()
+                    bands = self._parse_band_entries()
+                    if bands is None:
+                        return
+                    delta_band_vals, theta_band_vals = bands
+                    sleep_state = self._run_sleep_scoring_for_current_ids(
+                        delta_band=delta_band_vals,
+                        theta_band=theta_band_vals,
+                    )
                     if sleep_state is None:
                         return
                 else:
@@ -433,7 +514,14 @@ class VideoAnalysisApp(QMainWindow):
                 QMessageBox.Yes | QMessageBox.No
             )
             if reply == QMessageBox.Yes:
-                sleep_state = self._run_sleep_scoring_for_current_ids()
+                bands = self._parse_band_entries()
+                if bands is None:
+                    return
+                delta_band_vals, theta_band_vals = bands
+                sleep_state = self._run_sleep_scoring_for_current_ids(
+                    delta_band=delta_band_vals,
+                    theta_band=theta_band_vals,
+                )
                 if sleep_state is None:
                     return
             else:
@@ -449,7 +537,14 @@ class VideoAnalysisApp(QMainWindow):
                 QMessageBox.Yes | QMessageBox.No,
             )
             if reply == QMessageBox.Yes:
-                sleep_state = self._run_sleep_scoring_for_current_ids()
+                bands = self._parse_band_entries()
+                if bands is None:
+                    return
+                delta_band_vals, theta_band_vals = bands
+                sleep_state = self._run_sleep_scoring_for_current_ids(
+                    delta_band=delta_band_vals,
+                    theta_band=theta_band_vals,
+                )
                 if sleep_state is None:
                     return
                 ok, err_msg = self._validate_sleep_state_dict(sleep_state)
@@ -466,31 +561,94 @@ class VideoAnalysisApp(QMainWindow):
 
         self.sleep_state_path = sleep_state_path
 
+        self._populate_from_sleep_state(sleep_state, sleep_state_path)
+
+    def _validate_sleep_state_dict(self, sleep_state):
+        required_keys = [
+            "emg_rms_10hz",
+            "emg_rms_10hz_t",
+            "wheel_10hz",
+            "wheel_10hz_t",
+            "face_motion_10hz",
+            "face_motion_10hz_t",
+            "eeg_10hz",
+            "eeg_10hz_t",
+            "state_epoch",
+            "state_epoch_t",
+            "state_10hz",
+            "state_10hz_t",
+            "epoch_t",
+            "theta_power",
+            "delta_power",
+            "epoch_features",
+        ]
+        for key in required_keys:
+            if key not in sleep_state:
+                return False, f"sleep_state.pickle is missing '{key}'."
+
+        epoch_features = sleep_state.get("epoch_features")
+        if not isinstance(epoch_features, dict) or not epoch_features:
+            return False, "sleep_state.pickle has no cached epoch features."
+
+        return True, ""
+
+    def _run_sleep_scoring_for_current_ids(self, delta_band=None, theta_band=None):
+        progress_dialog = ScoringProgressDialog(self)
+        progress_dialog.show()
+        QApplication.processEvents()
+
+        def _progress_cb(fraction, message):
+            progress_dialog.update_progress(fraction, message)
+
+        try:
+            sleep_state = run_sleep_scoring(
+                self.userID,
+                self.expID,
+                delta_band=delta_band,
+                theta_band=theta_band,
+                progress_callback=_progress_cb,
+            )
+        except Exception as e:
+            QMessageBox.critical(self, "Sleep scoring error", f"Error running sleep scoring:\n{e}")
+            return None
+        finally:
+            progress_dialog.close()
+        if sleep_state is None:
+            QMessageBox.critical(self, "Sleep scoring error", "run_sleep_scoring returned no data.")
+            return None
+        return sleep_state
+
+    def _populate_from_sleep_state(self, sleep_state, sleep_state_path):
+        self.sleep_state_path = sleep_state_path
+        self.loaded_sleep_state = sleep_state
+
         # 10 Hz traces
-        self.emg_rms_10hz   = np.asarray(sleep_state['emg_rms_10hz'],   dtype=float)
+        self.emg_rms_10hz = np.asarray(sleep_state['emg_rms_10hz'], dtype=float)
         self.emg_rms_10hz_t = np.asarray(sleep_state['emg_rms_10hz_t'], dtype=float)
 
-        self.wheel_10hz     = np.asarray(sleep_state['wheel_10hz'],     dtype=float)
-        self.wheel_10hz_t   = np.asarray(sleep_state['wheel_10hz_t'],   dtype=float)
+        self.wheel_10hz = np.asarray(sleep_state['wheel_10hz'], dtype=float)
+        self.wheel_10hz_t = np.asarray(sleep_state['wheel_10hz_t'], dtype=float)
+        self.face_motion_10hz = np.asarray(sleep_state['face_motion_10hz'], dtype=float)
+        self.face_motion_10hz_t = np.asarray(sleep_state['face_motion_10hz_t'], dtype=float)
 
-        self.eeg_10hz       = np.asarray(sleep_state['eeg_10hz'],       dtype=float)
-        self.eeg_10hz_t     = np.asarray(sleep_state['eeg_10hz_t'],     dtype=float)
+        self.eeg_10hz = np.asarray(sleep_state['eeg_10hz'], dtype=float)
+        self.eeg_10hz_t = np.asarray(sleep_state['eeg_10hz_t'], dtype=float)
 
         # epoch-level
-        self.epoch_t        = np.asarray(sleep_state['epoch_t'],        dtype=float)
-        self.theta_power    = np.asarray(sleep_state['theta_power'],    dtype=float)
-        self.delta_power    = np.asarray(sleep_state['delta_power'],    dtype=float)
+        self.epoch_t = np.asarray(sleep_state['epoch_t'], dtype=float)
+        self.theta_power = np.asarray(sleep_state['theta_power'], dtype=float)
+        self.delta_power = np.asarray(sleep_state['delta_power'], dtype=float)
 
         # spectrogram
-        self.eeg_spectrogram       = np.asarray(sleep_state['eeg_spectrogram'],       dtype=float)
+        self.eeg_spectrogram = np.asarray(sleep_state['eeg_spectrogram'], dtype=float)
         self.eeg_spectrogram_freqs = np.asarray(sleep_state['eeg_spectrogram_freqs'], dtype=float)
-        self.eeg_spectrogram_t     = np.asarray(sleep_state['eeg_spectrogram_t'],     dtype=float)
+        self.eeg_spectrogram_t = np.asarray(sleep_state['eeg_spectrogram_t'], dtype=float)
 
         # state
-        self.state_epoch    = np.asarray(sleep_state['state_epoch'],    dtype=int)
-        self.state_epoch_t  = np.asarray(sleep_state['state_epoch_t'],  dtype=float)
-        self.state_10hz     = np.asarray(sleep_state['state_10hz'],     dtype=int)
-        self.state_10hz_t   = np.asarray(sleep_state['state_10hz_t'],   dtype=float)
+        self.state_epoch = np.asarray(sleep_state['state_epoch'], dtype=int)
+        self.state_epoch_t = np.asarray(sleep_state['state_epoch_t'], dtype=float)
+        self.state_10hz = np.asarray(sleep_state['state_10hz'], dtype=int)
+        self.state_10hz_t = np.asarray(sleep_state['state_10hz_t'], dtype=float)
 
         # thresholds
         self.emg_rms_threshold = float(sleep_state.get('emg_rms_threshold', np.nan))
@@ -525,7 +683,30 @@ class VideoAnalysisApp(QMainWindow):
                 self.state_label_map = dict(labels_obj)
             else:
                 self.state_label_map = {i: str(name) for i, name in enumerate(labels_obj)}
-        self.loaded_sleep_state = sleep_state
+
+        # band metadata
+        delta_band = sleep_state.get("delta_band", DEFAULT_DELTA_BAND)
+        theta_band = sleep_state.get("theta_band", DEFAULT_THETA_BAND)
+        try:
+            self.delta_band = (float(delta_band[0]), float(delta_band[1]))
+        except Exception:
+            self.delta_band = DEFAULT_DELTA_BAND
+        try:
+            self.theta_band = (float(theta_band[0]), float(theta_band[1]))
+        except Exception:
+            self.theta_band = DEFAULT_THETA_BAND
+
+        self.deltaBandLowEdit.setText(f"{self.delta_band[0]:.2f}")
+        self.deltaBandHighEdit.setText(f"{self.delta_band[1]:.2f}")
+        self.thetaBandLowEdit.setText(f"{self.theta_band[0]:.2f}")
+        self.thetaBandHighEdit.setText(f"{self.theta_band[1]:.2f}")
+        for widget in [
+            self.deltaBandLowEdit,
+            self.deltaBandHighEdit,
+            self.thetaBandLowEdit,
+            self.thetaBandHighEdit,
+        ]:
+            widget.setEnabled(True)
 
         # debug spans
         video_min = float(np.nanmin(self.eye_frame_times))
@@ -571,55 +752,75 @@ class VideoAnalysisApp(QMainWindow):
         self.autoRescoreCheck.setChecked(False)
         self.rescoreButton.setEnabled(True)
         self.saveButton.setEnabled(False)
+        self.showVideosCheck.setEnabled(True)
+        self.showOverlayCheck.setEnabled(True)
+        self.showVideosCheck.blockSignals(True)
+        self.showVideosCheck.setChecked(self.show_eye_videos)
+        self.showVideosCheck.blockSignals(False)
+        self.onShowVideosToggled(self.show_eye_videos)
+        self.showOverlayCheck.blockSignals(True)
+        self.showOverlayCheck.setChecked(self.show_pupil_overlay)
+        self.showOverlayCheck.blockSignals(False)
 
         self.loaded = True
         self._state_dirty = False
 
-        # Build epoch features for interactive reclassification
         self._rebuild_epoch_features()
-
         self._refresh_state_controls()
         self._update_save_button_state()
         self.updateFrame()
         self.plotTraces()
 
-    def _validate_sleep_state_dict(self, sleep_state):
-        required_keys = [
-            "emg_rms_10hz",
-            "emg_rms_10hz_t",
-            "wheel_10hz",
-            "wheel_10hz_t",
-            "eeg_10hz",
-            "eeg_10hz_t",
-            "state_epoch",
-            "state_epoch_t",
-            "state_10hz",
-            "state_10hz_t",
-            "epoch_t",
-            "theta_power",
-            "delta_power",
-            "epoch_features",
-        ]
-        for key in required_keys:
-            if key not in sleep_state:
-                return False, f"sleep_state.pickle is missing '{key}'."
-
-        epoch_features = sleep_state.get("epoch_features")
-        if not isinstance(epoch_features, dict) or not epoch_features:
-            return False, "sleep_state.pickle has no cached epoch features."
-
-        return True, ""
-
-    def _run_sleep_scoring_for_current_ids(self):
+    def _parse_band_entries(self):
         try:
-            sleep_state = run_sleep_scoring(self.userID, self.expID)
-        except Exception as e:
-            QMessageBox.critical(self, "Sleep scoring error", f"Error running sleep scoring:\n{e}")
+            delta_low = float(self.deltaBandLowEdit.text())
+            delta_high = float(self.deltaBandHighEdit.text())
+            theta_low = float(self.thetaBandLowEdit.text())
+            theta_high = float(self.thetaBandHighEdit.text())
+        except Exception:
+            QMessageBox.warning(self, "Band input error", "Delta/theta band values must be numeric.")
             return None
+
+        if delta_low <= 0 or delta_high <= 0 or delta_high <= delta_low:
+            QMessageBox.warning(self, "Band input error", "Delta band must be positive and low < high.")
+            return None
+        if theta_low <= 0 or theta_high <= 0 or theta_high <= theta_low:
+            QMessageBox.warning(self, "Band input error", "Theta band must be positive and low < high.")
+            return None
+
+        return (delta_low, delta_high), (theta_low, theta_high)
+
+    def _bands_changed(self, delta_band, theta_band):
+        tol = 1e-6
+        def diff(a, b):
+            return abs(a - b) > tol
+        if (
+            diff(delta_band[0], self.delta_band[0])
+            or diff(delta_band[1], self.delta_band[1])
+            or diff(theta_band[0], self.theta_band[0])
+            or diff(theta_band[1], self.theta_band[1])
+        ):
+            return True
+        return False
+
+    def _run_full_rescore_with_new_bands(self, delta_band, theta_band):
+        sleep_state = self._run_sleep_scoring_for_current_ids(
+            delta_band=delta_band,
+            theta_band=theta_band,
+        )
         if sleep_state is None:
-            QMessageBox.critical(self, "Sleep scoring error", "run_sleep_scoring returned no data.")
-            return None
-        return sleep_state
+            return
+        sleep_state_path = os.path.join(
+            self.exp_dir_processed,
+            "sleep_score",
+            "sleep_state.pickle",
+        )
+        self._populate_from_sleep_state(sleep_state, sleep_state_path)
+        QMessageBox.information(
+            self,
+            "Sleep scoring",
+            "Data reloaded with updated delta/theta bands.",
+        )
 
     def runSleepScoringClicked(self):
         user_id = self.userIdEdit.text().strip()
@@ -634,13 +835,36 @@ class VideoAnalysisApp(QMainWindow):
             QMessageBox.critical(self, "Path Error", f"Error resolving paths:\n{e}")
             return
 
+        bands = self._parse_band_entries()
+        if bands is None:
+            return
+        delta_band_vals, theta_band_vals = bands
+
+        progress_dialog = ScoringProgressDialog(self)
+        progress_dialog.show()
+        QApplication.processEvents()
+
+        success = False
         try:
-            run_sleep_scoring(user_id, exp_id)
+            run_sleep_scoring(
+                user_id,
+                exp_id,
+                delta_band=delta_band_vals,
+                theta_band=theta_band_vals,
+                progress_callback=progress_dialog.update_progress,
+            )
+            success = True
         except Exception as e:
             QMessageBox.critical(self, "Sleep scoring error", f"Error running sleep scoring:\n{e}")
-            return
+        finally:
+            progress_dialog.close()
 
-        QMessageBox.information(self, "Sleep scoring", "Sleep scoring finished successfully.\nYou can now press 'Load Data'.")
+        if success:
+            QMessageBox.information(
+                self,
+                "Sleep scoring",
+                "Sleep scoring finished successfully.\nYou can now press 'Load Data'.",
+            )
 
     # -----------------------------
     # Timeline helpers
@@ -657,6 +881,8 @@ class VideoAnalysisApp(QMainWindow):
     # Video overlay
     # -----------------------------
     def overlay_plot(self, frame, position, eyeDat):
+        if not self.show_pupil_overlay:
+            return frame
         try:
             if (
                 np.isnan(eyeDat['x'][position]) or
@@ -693,39 +919,63 @@ class VideoAnalysisApp(QMainWindow):
         frame = self.overlay_plot(frame, int(frame_position), eyedat)
         return frame
 
+    def onShowVideosToggled(self, checked):
+        self.show_eye_videos = bool(checked)
+        if hasattr(self, "leftVideoLabel") and self.leftVideoLabel is not None:
+            self.leftVideoLabel.setVisible(self.show_eye_videos)
+            if not self.show_eye_videos:
+                self.leftVideoLabel.clear()
+        if hasattr(self, "rightVideoLabel") and self.rightVideoLabel is not None:
+            self.rightVideoLabel.setVisible(self.show_eye_videos)
+            if not self.show_eye_videos:
+                self.rightVideoLabel.clear()
+        if self.show_eye_videos and self.loaded:
+            self.updateFrame()
+
+    def onOverlayToggled(self, checked):
+        self.show_pupil_overlay = bool(checked)
+        if self.show_eye_videos and self.loaded:
+            self.updateFrame()
+
     def updateFrame(self):
         if not self.loaded:
             return
 
         t = self._current_time()
 
-        if self.eye_frame_times is not None and self.eye_frame_times.size > 0:
-            idx_frame = int(np.argmin(np.abs(self.eye_frame_times - t)))
+        if self.show_eye_videos:
+            if self.eye_frame_times is not None and self.eye_frame_times.size > 0:
+                idx_frame = int(np.argmin(np.abs(self.eye_frame_times - t)))
+            else:
+                idx_frame = 0
+
+            frame_left = self.playVideoFrame(idx_frame, self.video_path_left, self.left_eyedat)
+            if frame_left is not None:
+                image_left = QtGui.QImage(
+                    frame_left.data, frame_left.shape[1], frame_left.shape[0],
+                    frame_left.strides[0], QtGui.QImage.Format_RGB888
+                )
+                pixmap_left = QtGui.QPixmap.fromImage(image_left)
+                self.leftVideoLabel.setPixmap(pixmap_left.scaled(self.leftVideoLabel.size(), Qt.KeepAspectRatio))
+
+            frame_right = self.playVideoFrame(idx_frame, self.video_path_right, self.right_eyedat)
+            if frame_right is not None:
+                image_right = QtGui.QImage(
+                    frame_right.data, frame_right.shape[1], frame_right.shape[0],
+                    frame_right.strides[0], QtGui.QImage.Format_RGB888
+                )
+                pixmap_right = QtGui.QPixmap.fromImage(image_right)
+                self.rightVideoLabel.setPixmap(pixmap_right.scaled(self.rightVideoLabel.size(), Qt.KeepAspectRatio))
         else:
-            idx_frame = 0
-
-        frame_left = self.playVideoFrame(idx_frame, self.video_path_left, self.left_eyedat)
-        if frame_left is not None:
-            image_left = QtGui.QImage(
-                frame_left.data, frame_left.shape[1], frame_left.shape[0],
-                frame_left.strides[0], QtGui.QImage.Format_RGB888
-            )
-            pixmap_left = QtGui.QPixmap.fromImage(image_left)
-            self.leftVideoLabel.setPixmap(pixmap_left.scaled(self.leftVideoLabel.size(), Qt.KeepAspectRatio))
-
-        frame_right = self.playVideoFrame(idx_frame, self.video_path_right, self.right_eyedat)
-        if frame_right is not None:
-            image_right = QtGui.QImage(
-                frame_right.data, frame_right.shape[1], frame_right.shape[0],
-                frame_right.strides[0], QtGui.QImage.Format_RGB888
-            )
-            pixmap_right = QtGui.QPixmap.fromImage(image_right)
-            self.rightVideoLabel.setPixmap(pixmap_right.scaled(self.rightVideoLabel.size(), Qt.KeepAspectRatio))
+            if self.leftVideoLabel is not None:
+                self.leftVideoLabel.clear()
+            if self.rightVideoLabel is not None:
+                self.rightVideoLabel.clear()
 
         if self.vlines:
             for vline in self.vlines:
                 try:
-                    vline.set_xdata(t)
+                    vline.set_xdata([t, t])
                 except Exception:
                     pass
             self.canvas.draw_idle()
@@ -799,6 +1049,8 @@ class VideoAnalysisApp(QMainWindow):
                 self._set_selection_visual(ax, xmin, xmax)
             return on_select
 
+        selector_props = dict(alpha=0.0, facecolor='none', edgecolor='none', linewidth=0)
+
         for ax in self.figure.axes:
             selector = SpanSelector(
                 ax,
@@ -806,7 +1058,7 @@ class VideoAnalysisApp(QMainWindow):
                 direction='horizontal',
                 useblit=True,
                 interactive=True,
-                props=dict(alpha=0.15, facecolor='yellow')
+                props=selector_props,
             )
             selector.set_active(self._selection_enabled())
             self.span_selectors.append(selector)
@@ -822,17 +1074,6 @@ class VideoAnalysisApp(QMainWindow):
         patch = ax.axvspan(xmin, xmax, color='yellow', alpha=0.3)
         self.selection_patch = patch
         self.selection_patches = [patch]
-
-        for selector in self.span_selectors:
-            if selector.ax is ax:
-                continue
-            artist = getattr(selector, "_selection_artist", None)
-            if artist is not None:
-                try:
-                    artist.remove()
-                except Exception:
-                    pass
-                selector._selection_artist = None
 
         self.canvas.draw_idle()
 
@@ -1051,7 +1292,14 @@ class VideoAnalysisApp(QMainWindow):
     def onRescoreClicked(self):
         if not self.loaded:
             return
-        self.rerun_classification()
+        band_values = self._parse_band_entries()
+        if band_values is None:
+            return
+        delta_band_vals, theta_band_vals = band_values
+        if self._bands_changed(delta_band_vals, theta_band_vals):
+            self._run_full_rescore_with_new_bands(delta_band_vals, theta_band_vals)
+        else:
+            self.rerun_classification()
 
     def saveSleepScoring(self):
         if not self.loaded:
@@ -1270,12 +1518,12 @@ class VideoAnalysisApp(QMainWindow):
         fig = self.figure
 
         # Reserve space at bottom for sliders
-        fig.subplots_adjust(bottom=0.16, top=0.98, left=0.07, right=0.98, hspace=0.12)
+        fig.subplots_adjust(bottom=0.08, top=0.88, left=0.07, right=0.98, hspace=0.12)
 
         # Slider axes (normalized figure coords)
-        ax_s_emg = fig.add_axes([0.08, 0.06, 0.28, 0.03])
-        ax_s_wheel = fig.add_axes([0.40, 0.06, 0.28, 0.03])
-        ax_s_ratio = fig.add_axes([0.72, 0.06, 0.20, 0.03])
+        ax_s_emg = fig.add_axes([0.08, 0.91, 0.28, 0.03])
+        ax_s_wheel = fig.add_axes([0.40, 0.91, 0.28, 0.03])
+        ax_s_ratio = fig.add_axes([0.72, 0.91, 0.20, 0.03])
 
         # Data-driven slider ranges
         emg_vals = self.emg_rms_mean_by_epoch
@@ -1479,16 +1727,9 @@ class VideoAnalysisApp(QMainWindow):
         ratio_masked = theta_masked / delta_masked
         ratio_masked[~np.isfinite(ratio_masked)] = np.nan
 
-        theta_z = self._zscore_safe(theta_masked)
-        delta_z = self._zscore_safe(delta_masked)
-
-        # delta power threshold in z units (for display only)
-        delta_thr_z = None
-        if self.delta_power_threshold is not None:
-            mu_delta = np.nanmean(delta_masked)
-            sigma_delta = np.nanstd(delta_masked)
-            if sigma_delta > 0 and np.isfinite(sigma_delta):
-                delta_thr_z = (float(self.delta_power_threshold) - mu_delta) / sigma_delta
+        delta_thr_value = None
+        if self.delta_power_threshold is not None and np.isfinite(self.delta_power_threshold):
+            delta_thr_value = float(self.delta_power_threshold)
 
         # Full rebuild
         self.figure.clear()
@@ -1522,11 +1763,29 @@ class VideoAnalysisApp(QMainWindow):
         ax2.tick_params(axis='y', labelcolor=wheel_color)
         ax2.spines['left'].set_color(wheel_color)
         ax2.tick_params(axis='x', labelbottom=False)
+        if (
+            isinstance(self.face_motion_10hz, np.ndarray)
+            and isinstance(self.face_motion_10hz_t, np.ndarray)
+            and self.face_motion_10hz.size > 0
+        ):
+            motion_ax = ax2.twinx()
+            motion_vals = self._zscore_safe(self.face_motion_10hz)
+            motion_ax.plot(
+                self.face_motion_10hz_t,
+                motion_vals,
+                color="0.4",
+                linewidth=1.0,
+                label="Motion"
+            )
+            motion_ax.set_ylabel("Motion", color="0.4")
+            motion_ax.tick_params(axis='y', labelcolor="0.4")
+            motion_ax.spines['top'].set_visible(False)
+            motion_ax.spines['right'].set_color("0.4")
 
         # 3) EEG 10 Hz
         ax3 = axs[2]
         ax3.plot(self.eeg_10hz_t, self.eeg_10hz)
-        ax3.set_ylabel("EEG (10 Hz)")
+        ax3.set_ylabel("EEG")
         ax3.spines['top'].set_visible(False)
         ax3.spines['right'].set_visible(False)
         ax3.tick_params(axis='x', labelbottom=False)
@@ -1573,25 +1832,32 @@ class VideoAnalysisApp(QMainWindow):
                 ax4.imshow(spec_band, **im_args)
                 ax4.set_ylim(0, max_freq)
 
-        for y in [1.0, 4.0, 8.0]:
-            ax4.axhline(y=y, color='white', linestyle=':', linewidth=1)
+        delta_low, delta_high = self.delta_band
+        theta_low, theta_high = self.theta_band
+        for y, color in [
+            (delta_low, 'white'),
+            (delta_high, 'white'),
+            (theta_low, 'cyan'),
+            (theta_high, 'cyan'),
+        ]:
+            ax4.axhline(y=y, color=color, linestyle=':', linewidth=1)
 
         ax4.set_ylabel("Freq (Hz)")
         ax4.spines['top'].set_visible(False)
         ax4.spines['right'].set_visible(False)
         ax4.tick_params(axis='x', labelbottom=False)
 
-        # 5) Theta + Delta (z-scored)
+        # 5) Theta + Delta (raw power)
         ax5 = axs[4]
-        ax5.plot(self.epoch_t, theta_z, label="Theta (z)")
-        ax5.plot(self.epoch_t, delta_z, label="Delta (z)")
-        ax5.set_ylabel("Power (z)")
+        ax5.plot(self.epoch_t, theta_masked, label="Theta")
+        ax5.plot(self.epoch_t, delta_masked, label="Delta")
+        ax5.set_ylabel("Power")
         ax5.spines['top'].set_visible(False)
         ax5.spines['right'].set_visible(False)
         ax5.tick_params(axis='x', labelbottom=False)
         ax5.legend(loc="upper right")
-        if delta_thr_z is not None:
-            ax5.axhline(delta_thr_z, color='r', linestyle='--', linewidth=1)
+        if delta_thr_value is not None:
+            ax5.axhline(delta_thr_value, color='r', linestyle='--', linewidth=1)
 
         # 6) Ratio plot
         ax6 = axs[5]
