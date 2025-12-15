@@ -65,7 +65,7 @@ STATE_LABELS = {
     STATE_REM: "rem",
 }
 
-DEFAULT_DELTA_BAND = (1.0, 10.0)
+DEFAULT_DELTA_BAND = (1.0, 5.0)
 DEFAULT_THETA_BAND = (5.0, 10.0)
 
 
@@ -124,19 +124,35 @@ def apply_eeg_emg_filters(eeg_raw, emg_raw, fs):
       - emg: 100–499 Hz band-pass
     """
     print("  - applying notch and band-pass filters to eeg/emg")
+    if fs <= 0:
+        raise ValueError("sampling frequency must be positive")
     notch_freq = 50.0
     q_factor = 20.0
 
+    def _design_notch(freq):
+        nyquist = 0.5 * fs
+        if freq <= 0 or freq >= nyquist:
+            return None
+        return signal.iirnotch(freq, q_factor, fs)
+
     # base notch
-    b_notch, a_notch = signal.iirnotch(notch_freq, q_factor, fs)
-    eeg_notched = filtfilt(b_notch, a_notch, eeg_raw)
-    emg_notched = filtfilt(b_notch, a_notch, emg_raw)
+    notch_coeff = _design_notch(notch_freq)
+    if notch_coeff is not None:
+        b_notch, a_notch = notch_coeff
+        eeg_notched = filtfilt(b_notch, a_notch, eeg_raw)
+        emg_notched = filtfilt(b_notch, a_notch, emg_raw)
+    else:
+        eeg_notched = eeg_raw
+        emg_notched = emg_raw
 
     # additional harmonics
     eeg_series = eeg_notched
     emg_series = emg_notched
     for harmonic in range(100, 451, 50):
-        b_h, a_h = signal.iirnotch(harmonic, q_factor, fs)
+        coeffs = _design_notch(harmonic)
+        if coeffs is None:
+            continue
+        b_h, a_h = coeffs
         eeg_series = filtfilt(b_h, a_h, eeg_series)
         emg_series = filtfilt(b_h, a_h, emg_series)
 
@@ -176,10 +192,11 @@ def downsample_to_target_fs(x, fs_original, fs_target, t=None):
     downsample by integer factor (fs_original / fs_target).
     optionally downsample matching time vector t (same length as x).
     """
-    if fs_original % fs_target != 0:
+    fs_orig_val = float(fs_original)
+    if fs_orig_val % fs_target != 0:
         raise ValueError("fs_original must be an integer multiple of fs_target")
 
-    factor = fs_original // fs_target
+    factor = int(fs_orig_val // fs_target)
     x_ds = x[::factor]
     if t is not None:
         t_ds = t[::factor]
@@ -498,6 +515,7 @@ def make_qc_figures(
     emg_rms_mean_by_epoch,
     wheel_speed_mean_by_epoch,
     figs_folder,
+    filename_suffix="",
 ):
     # 1) EMG filtered + RMS
     fig, ax = plt.subplots(2, 1, figsize=(16, 8))
@@ -507,7 +525,7 @@ def make_qc_figures(
     ax[1].set_title("emg_rms (1 s window)")
     fig.suptitle("sanity check emg & rms", fontsize=16)
     fig.tight_layout()
-    fig.savefig(os.path.join(figs_folder, "01_sanity_emg_rms.png"))
+    fig.savefig(os.path.join(figs_folder, f"01_sanity_emg_rms{filename_suffix}.png"))
     plt.close(fig)
 
     # 2) multisignal: EEG spectrogram, EMG spectrogram, RMS, wheel
@@ -546,7 +564,7 @@ def make_qc_figures(
     axes[3].set_title("wheel_speed_resampled")
 
     fig.tight_layout()
-    fig.savefig(os.path.join(figs_folder, "05_multisignal_sanity.png"))
+    fig.savefig(os.path.join(figs_folder, f"05_multisignal_sanity{filename_suffix}.png"))
     plt.close(fig)
 
     # 3) hypnogram + EMG epoch mean + wheel epoch mean
@@ -560,7 +578,7 @@ def make_qc_figures(
     axes[2].plot(epoch_time, wheel_speed_mean_by_epoch, linewidth=0.5)
     axes[2].set_title("wheel_speed_mean_by_epoch")
     fig.tight_layout()
-    fig.savefig(os.path.join(figs_folder, "06_hypnogram_emg_wheel.png"))
+    fig.savefig(os.path.join(figs_folder, f"06_hypnogram_emg_wheel{filename_suffix}.png"))
     plt.close(fig)
 
 
@@ -575,6 +593,8 @@ def run_sleep_scoring(
     delta_band=None,
     theta_band=None,
     progress_callback=None,
+    simulated_npz=None,
+    filename_suffix="",
 ):
     """
     Sleep scoring pipeline.
@@ -591,6 +611,10 @@ def run_sleep_scoring(
         Theta band passband (Hz). Defaults to DEFAULT_THETA_BAND.
     progress_callback : callable, optional
         Invoked as progress_callback(fraction, message) as the pipeline advances.
+    simulated_npz : str, optional
+        Path to an `.npz` file that contains `eeg` and `emg` arrays for simulated scoring.
+    filename_suffix : str, optional
+        String appended before the extension on any output files (e.g., `_sim`).
 
     Returns
     -------
@@ -609,6 +633,8 @@ def run_sleep_scoring(
     step_idx = 0
     _report_progress(progress_callback, step_idx, total_steps, "Starting sleep scoring")
     print(f"starting sleep scoring for user_id={user_id}, exp_id={exp_id}")
+    suffix = filename_suffix or ""
+    simulated = simulated_npz is not None
 
     # -------------------------------------------------------------
     # 1. paths and loading
@@ -621,17 +647,29 @@ def run_sleep_scoring(
     sleep_score_folder = ensure_dir(os.path.join(exp_dir_processed, "sleep_score"))
     figs_folder = ensure_dir(os.path.join(sleep_score_folder, "figs"))
 
-    recordings_dir = os.path.join(exp_dir_processed, "recordings")
+    if simulated:
+        with np.load(simulated_npz) as sim_data:
+            eeg_raw = np.asarray(sim_data["eeg"], dtype=float)
+            emg_raw = np.asarray(sim_data["emg"], dtype=float)
+            fs_val = sim_data.get("fs", sim_data.get("fs_original", FS_EPHYS))
+            fs = float(fs_val)
+            if eeg_raw.shape != emg_raw.shape:
+                raise ValueError("simulated eeg and emg arrays must be the same length")
+            n_samples = eeg_raw.size
+            t_ephys = np.arange(n_samples, dtype=float) / fs
+            print(f"  - simulated ephys length: {n_samples} samples")
+    else:
+        recordings_dir = os.path.join(exp_dir_processed, "recordings")
 
-    all_ephys = np.load(open(os.path.join(recordings_dir, "ephys.npy"), "rb"))
-    wheel_df = pd.read_pickle(open(os.path.join(recordings_dir, "wheel.pickle"), "rb"))
+        all_ephys = np.load(open(os.path.join(recordings_dir, "ephys.npy"), "rb"))
+        wheel_df = pd.read_pickle(open(os.path.join(recordings_dir, "wheel.pickle"), "rb"))
 
-    t_ephys = all_ephys[0, :]
-    eeg_raw = all_ephys[1, :]
-    emg_raw = all_ephys[2, :]
-    fs = FS_EPHYS
+        t_ephys = all_ephys[0, :]
+        eeg_raw = all_ephys[1, :]
+        emg_raw = all_ephys[2, :]
+        fs = FS_EPHYS
 
-    print(f"  - ephys length: {len(t_ephys)} samples")
+        print(f"  - ephys length: {len(t_ephys)} samples")
 
     if delta_band is None:
         delta_band = DEFAULT_DELTA_BAND
@@ -699,12 +737,18 @@ def run_sleep_scoring(
     # 6. resample wheel speed to ephys time base
     # -------------------------------------------------------------
     step_idx += 1
-    _report_progress(progress_callback, step_idx, total_steps, "Resampling wheel speed")
-    print("[6/9] resampling wheel speed to ephys time base")
-    wheel_speed_raw = wheel_df["speed"]
-    wheel_t = wheel_df["t"]
-    wheel_speed_resampled = np.interp(t_ephys, wheel_t, wheel_speed_raw)
-    wheel_speed_full = wheel_speed_resampled.copy()  # for plotting
+    wheel_step_msg = "Using simulated wheel speed (zeros)" if simulated else "Resampling wheel speed"
+    _report_progress(progress_callback, step_idx, total_steps, wheel_step_msg)
+    if simulated:
+        print("[6/9] using simulated wheel speed (zeros)")
+        wheel_speed_full = np.zeros_like(t_ephys, dtype=float)
+        wheel_speed_resampled = wheel_speed_full.copy()
+    else:
+        print("[6/9] resampling wheel speed to ephys time base")
+        wheel_speed_raw = wheel_df["speed"]
+        wheel_t = wheel_df["t"]
+        wheel_speed_resampled = np.interp(t_ephys, wheel_t, wheel_speed_raw)
+        wheel_speed_full = wheel_speed_resampled.copy()  # for plotting
 
     # -------------------------------------------------------------
     # 7. epoching (10 s epochs) and epoch-level features
@@ -889,7 +933,7 @@ def run_sleep_scoring(
     step_idx += 1
     _report_progress(progress_callback, step_idx, total_steps, "Saving outputs")
     print("saving outputs")
-    sleep_state_path = os.path.join(sleep_score_folder, "sleep_state.pickle")
+    sleep_state_path = os.path.join(sleep_score_folder, f"sleep_state{suffix}.pickle")
     with open(sleep_state_path, "wb") as f:
         pickle.dump(sleep_state, f)
 
@@ -912,6 +956,7 @@ def run_sleep_scoring(
             emg_rms_mean_by_epoch=emg_rms_mean_by_epoch,
             wheel_speed_mean_by_epoch=wheel_speed_mean_by_epoch,
             figs_folder=figs_folder,
+            filename_suffix=suffix,
         )
 
     duration = time.time() - start_time

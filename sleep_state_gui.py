@@ -10,7 +10,8 @@ from PyQt5 import QtWidgets, QtCore, QtGui
 from PyQt5.QtWidgets import (
     QMainWindow, QApplication, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QPushButton, QLineEdit, QSlider, QMessageBox, QSizePolicy,
-    QCheckBox, QRadioButton, QButtonGroup, QProgressBar
+    QCheckBox, QRadioButton, QButtonGroup, QProgressBar, QDoubleSpinBox,
+    QInputDialog,
 )
 from PyQt5.QtCore import Qt, QTimer
 
@@ -28,6 +29,8 @@ from sleep_score import (
     build_epoch_feature_dict,
     DEFAULT_DELTA_BAND,
     DEFAULT_THETA_BAND,
+    DEFAULT_USER_ID,
+    DEFAULT_EXP_ID,
 )
 
 
@@ -135,6 +138,119 @@ class DraggableHLine:
         self._dragging = False
 
 
+class DraggableVLine:
+    """
+    Robust draggable vertical line using explicit proximity detection.
+    - Creates axvline internally for every supplied axis.
+    - Binds to the shared figure canvas.
+    - No picking, no widgetlock, no toolbar logic.
+    """
+
+    def __init__(
+        self,
+        axes,
+        x0,
+        color="r",
+        linestyle="--",
+        linewidth=1.5,
+        tolerance_px=6,
+        on_changed=None,
+        is_enabled_fn=None,
+    ):
+        self.axes = list(axes) if axes else []
+        self.canvas = None
+        if self.axes:
+            self.canvas = self.axes[0].figure.canvas
+        self.on_changed = on_changed
+        self.tolerance_px = tolerance_px
+        self.is_enabled_fn = is_enabled_fn
+
+        self.lines = []
+        for ax in self.axes:
+            line = ax.axvline(
+                x0,
+                color=color,
+                linestyle=linestyle,
+                linewidth=linewidth,
+                zorder=10,
+            )
+            self.lines.append(line)
+
+        self._dragging = False
+
+        self.cid_press = None
+        self.cid_motion = None
+        self.cid_release = None
+        if self.canvas is not None:
+            self.cid_press = self.canvas.mpl_connect("button_press_event", self._on_press)
+            self.cid_motion = self.canvas.mpl_connect("motion_notify_event", self._on_motion)
+            self.cid_release = self.canvas.mpl_connect("button_release_event", self._on_release)
+
+    def disconnect(self):
+        for cid in [self.cid_press, self.cid_motion, self.cid_release]:
+            try:
+                if cid is not None:
+                    self.canvas.mpl_disconnect(cid)
+            except Exception:
+                pass
+
+    def get_x(self):
+        if not self.lines:
+            return 0.0
+        return float(self.lines[0].get_xdata()[0])
+
+    def set_x(self, x, trigger_callback=True):
+        for line in self.lines:
+            line.set_xdata([x, x])
+        if trigger_callback and self.on_changed is not None:
+            self.on_changed(float(x))
+        if self.canvas is not None:
+            self.canvas.draw_idle()
+
+    def _enabled(self):
+        if self.is_enabled_fn is None:
+            return True
+        try:
+            return bool(self.is_enabled_fn())
+        except Exception:
+            return True
+
+    def _is_near_line(self, event):
+        if event.inaxes not in self.axes:
+            return False
+        if event.xdata is None:
+            return False
+
+        x_line = self.get_x()
+        trans = event.inaxes.transData
+        p_event = trans.transform((event.xdata, 0.0))
+        p_line = trans.transform((x_line, 0.0))
+        dx = abs(p_event[0] - p_line[0])
+        return dx <= self.tolerance_px
+
+    def _on_press(self, event):
+        if not self._enabled():
+            return
+        if event.button != 1:
+            return
+        if self._is_near_line(event):
+            self._dragging = True
+
+    def _on_motion(self, event):
+        if not self._enabled():
+            return
+        if not self._dragging:
+            return
+        if event.inaxes not in self.axes:
+            return
+        if event.xdata is None:
+            return
+        self.set_x(event.xdata, trigger_callback=True)
+
+    def _on_release(self, event):
+        self._dragging = False
+
+
 class ScoringProgressDialog(QtWidgets.QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -177,7 +293,11 @@ class VideoAnalysisApp(QMainWindow):
         # drag selection
         self.selection_range = None
         self.selection_patch = None
+        self.selection_patches = []
         self.span_selectors = []
+        self._selection_line_start = None
+        self._selection_line_end = None
+        self._selection_patch_axis_index = None
 
         # state label map
         self.state_label_map = None
@@ -201,14 +321,16 @@ class VideoAnalysisApp(QMainWindow):
         self.sleep_state_path = None
         self.left_video_cap = None
         self.right_video_cap = None
-        self.left_video_scale_params = None
-        self.right_video_scale_params = None
         self.debug_frame_timing = True
+        self.motion_smoothing_secs = 0.5
         self._state_dirty = False
-        self.selection_patches = []
         self.available_state_values = set()
         self.delta_band = DEFAULT_DELTA_BAND
         self.theta_band = DEFAULT_THETA_BAND
+        self.simulation_enabled = False
+        self.simulated_sample_name = None
+        self.simulated_sample_path = None
+        self.sample_data_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sample_data")
 
         # Matplotlib widgets/objects
         self.figure = None
@@ -249,8 +371,10 @@ class VideoAnalysisApp(QMainWindow):
         inputLayout = QHBoxLayout()
         self.userIdEdit = QLineEdit()
         self.userIdEdit.setPlaceholderText("Enter User ID")
+        self.userIdEdit.setText(DEFAULT_USER_ID)
         self.expIdEdit = QLineEdit()
         self.expIdEdit.setPlaceholderText("Enter Experiment ID")
+        self.expIdEdit.setText(DEFAULT_EXP_ID)
 
         self.loadButton = QPushButton("Load Data")
         self.loadButton.clicked.connect(self.loadData)
@@ -258,12 +382,20 @@ class VideoAnalysisApp(QMainWindow):
         self.scoreButton = QPushButton("Run Sleep Scoring")
         self.scoreButton.clicked.connect(self.runSleepScoringClicked)
 
+        self.simulationCheck = QCheckBox("Simulated EEG/EMG")
+        self.simulationCheck.toggled.connect(self.onSimModeToggled)
+        self.simulationLabel = QLabel("")
+        self.simulationLabel.setFixedWidth(140)
+        self.simulationLabel.setStyleSheet("color: gray;")
+
         inputLayout.addWidget(QLabel("User ID:"))
         inputLayout.addWidget(self.userIdEdit)
         inputLayout.addWidget(QLabel("Experiment ID:"))
         inputLayout.addWidget(self.expIdEdit)
         inputLayout.addWidget(self.loadButton)
         inputLayout.addWidget(self.scoreButton)
+        inputLayout.addWidget(self.simulationCheck)
+        inputLayout.addWidget(self.simulationLabel)
         mainLayout.addLayout(inputLayout)
 
         # --- Video controls ---
@@ -320,6 +452,15 @@ class VideoAnalysisApp(QMainWindow):
         self.showOverlayCheck.setEnabled(False)
         self.showOverlayCheck.toggled.connect(self.onOverlayToggled)
         videoOptionsLayout.addWidget(self.showOverlayCheck)
+        videoOptionsLayout.addSpacing(20)
+        videoOptionsLayout.addWidget(QLabel("Motion smoothing (s):"))
+        self.motionSmoothSpin = QDoubleSpinBox()
+        self.motionSmoothSpin.setRange(0.0, 5.0)
+        self.motionSmoothSpin.setSingleStep(0.1)
+        self.motionSmoothSpin.setValue(self.motion_smoothing_secs)
+        self.motionSmoothSpin.setFixedWidth(100)
+        self.motionSmoothSpin.valueChanged.connect(self.onMotionSmoothingChanged)
+        videoOptionsLayout.addWidget(self.motionSmoothSpin)
         videoOptionsLayout.addStretch(1)
         mainLayout.addLayout(videoOptionsLayout)
 
@@ -423,6 +564,83 @@ class VideoAnalysisApp(QMainWindow):
         self.state_shortcuts = []
         self.state_shortcut_map = {}
 
+    def onSimModeToggled(self, checked):
+        checked = bool(checked)
+        if checked:
+            selection = self._prompt_for_simulation_sample()
+            if selection is None:
+                self.simulationCheck.blockSignals(True)
+                self.simulationCheck.setChecked(False)
+                self.simulationCheck.blockSignals(False)
+                self.simulation_enabled = False
+            else:
+                self.simulation_enabled = True
+        else:
+            self.simulation_enabled = False
+        self._update_simulation_label()
+
+    def _prompt_for_simulation_sample(self):
+        options = self._list_simulation_files()
+        if not options:
+            QMessageBox.warning(self, "Simulation data", "No sample_data files were found.")
+            return None
+        default_index = 0
+        if self.simulated_sample_name in options:
+            default_index = options.index(self.simulated_sample_name)
+        selection, ok = QInputDialog.getItem(
+            self,
+            "Select simulated EEG/EMG",
+            "Dataset:",
+            options,
+            default_index,
+            False,
+        )
+        if not ok:
+            return None
+        path = os.path.join(self.sample_data_dir, selection)
+        if not os.path.isfile(path):
+            QMessageBox.warning(self, "Simulation data", f"Selected dataset is not available: {selection}")
+            return None
+        self.simulated_sample_name = selection
+        self.simulated_sample_path = path
+        return selection
+
+    def _list_simulation_files(self):
+        try:
+            files = sorted(
+                entry
+                for entry in os.listdir(self.sample_data_dir)
+                if entry.lower().endswith(".npz")
+            )
+        except Exception:
+            files = []
+        return files
+
+    def _update_simulation_label(self):
+        if self.simulation_enabled and self.simulated_sample_name:
+            self.simulationLabel.setText(self.simulated_sample_name)
+            self.simulationLabel.setToolTip("Simulated EEG/EMG data will be used for scoring.")
+        else:
+            self.simulationLabel.setText("")
+            self.simulationLabel.setToolTip("")
+
+    def _simulation_suffix(self):
+        return "_sim" if self.simulation_enabled else ""
+
+    def _simulation_npz_path(self):
+        if self.simulation_enabled and self.simulated_sample_path:
+            return self.simulated_sample_path
+        return None
+
+    def _sleep_state_basename(self):
+        return f"sleep_state{self._simulation_suffix()}.pickle"
+
+    def _sleep_state_path(self):
+        processed_root = getattr(self, "exp_dir_processed", None)
+        if not processed_root:
+            return None
+        return os.path.join(processed_root, "sleep_score", self._sleep_state_basename())
+
     # -----------------------------
     # Load data
     # -----------------------------
@@ -488,7 +706,8 @@ class VideoAnalysisApp(QMainWindow):
             return
 
         # sleep_state data (load or offer to generate)
-        sleep_state_path = os.path.join(self.exp_dir_processed, "sleep_score", "sleep_state.pickle")
+        sleep_state_name = self._sleep_state_basename()
+        sleep_state_path = os.path.join(self.exp_dir_processed, "sleep_score", sleep_state_name)
         sleep_state = None
 
         if os.path.isfile(sleep_state_path):
@@ -499,7 +718,7 @@ class VideoAnalysisApp(QMainWindow):
                 reply = QMessageBox.question(
                     self,
                     "Sleep scoring error",
-                    f"Error loading sleep_state.pickle:\n{e}\n\nDo you want to rerun sleep scoring now?",
+                    f"Error loading {sleep_state_name}:\n{e}\n\nDo you want to rerun sleep scoring now?",
                     QMessageBox.Yes | QMessageBox.No,
                 )
                 if reply == QMessageBox.Yes:
@@ -520,7 +739,7 @@ class VideoAnalysisApp(QMainWindow):
             reply = QMessageBox.question(
                 self,
                 "Sleep scoring not found",
-                "sleep_state.pickle was not found.\nDo you want to run sleep scoring now?",
+                f"{sleep_state_name} was not found.\nDo you want to run sleep scoring now?",
                 QMessageBox.Yes | QMessageBox.No
             )
             if reply == QMessageBox.Yes:
@@ -538,7 +757,7 @@ class VideoAnalysisApp(QMainWindow):
                 QMessageBox.information(self, "Sleep scoring", "Load cancelled: sleep scoring data not available.")
                 return
 
-        ok, err_msg = self._validate_sleep_state_dict(sleep_state)
+        ok, err_msg = self._validate_sleep_state_dict(sleep_state, sleep_state_name)
         if not ok:
             reply = QMessageBox.question(
                 self,
@@ -557,7 +776,7 @@ class VideoAnalysisApp(QMainWindow):
                 )
                 if sleep_state is None:
                     return
-                ok, err_msg = self._validate_sleep_state_dict(sleep_state)
+                ok, err_msg = self._validate_sleep_state_dict(sleep_state, sleep_state_name)
                 if not ok:
                     QMessageBox.critical(
                         self,
@@ -573,7 +792,7 @@ class VideoAnalysisApp(QMainWindow):
 
         self._populate_from_sleep_state(sleep_state, sleep_state_path)
 
-    def _validate_sleep_state_dict(self, sleep_state):
+    def _validate_sleep_state_dict(self, sleep_state, file_label=None):
         required_keys = [
             "emg_rms_10hz",
             "emg_rms_10hz_t",
@@ -592,13 +811,14 @@ class VideoAnalysisApp(QMainWindow):
             "delta_power",
             "epoch_features",
         ]
+        label = file_label or "sleep_state data"
         for key in required_keys:
             if key not in sleep_state:
-                return False, f"sleep_state.pickle is missing '{key}'."
+                return False, f"{label} is missing '{key}'."
 
         epoch_features = sleep_state.get("epoch_features")
         if not isinstance(epoch_features, dict) or not epoch_features:
-            return False, "sleep_state.pickle has no cached epoch features."
+            return False, f"{label} has no cached epoch features."
 
         return True, ""
 
@@ -617,6 +837,8 @@ class VideoAnalysisApp(QMainWindow):
                 delta_band=delta_band,
                 theta_band=theta_band,
                 progress_callback=_progress_cb,
+                simulated_npz=self._simulation_npz_path(),
+                filename_suffix=self._simulation_suffix(),
             )
         except Exception as e:
             QMessageBox.critical(self, "Sleep scoring error", f"Error running sleep scoring:\n{e}")
@@ -820,11 +1042,7 @@ class VideoAnalysisApp(QMainWindow):
         )
         if sleep_state is None:
             return
-        sleep_state_path = os.path.join(
-            self.exp_dir_processed,
-            "sleep_score",
-            "sleep_state.pickle",
-        )
+        sleep_state_path = self._sleep_state_path()
         self._populate_from_sleep_state(sleep_state, sleep_state_path)
         QMessageBox.information(
             self,
@@ -862,6 +1080,8 @@ class VideoAnalysisApp(QMainWindow):
                 delta_band=delta_band_vals,
                 theta_band=theta_band_vals,
                 progress_callback=progress_dialog.update_progress,
+                simulated_npz=self._simulation_npz_path(),
+                filename_suffix=self._simulation_suffix(),
             )
             success = True
         except Exception as e:
@@ -909,22 +1129,7 @@ class VideoAnalysisApp(QMainWindow):
         frame = cv2.circle(frame, center, radius, color, 2)
         return frame
 
-    def _apply_frame_scaling(self, gray_frame, scale_params):
-        gray = np.asarray(gray_frame, dtype=float)
-        if scale_params is None:
-            p70 = np.percentile(gray, 70)
-            min_val = float(np.min(gray))
-            max_val = float(np.max(gray))
-        else:
-            p70, min_val, max_val = scale_params
-        clipped = np.minimum(gray, p70)
-        denom = max_val - min_val
-        if denom <= 0:
-            denom = 1.0
-        scaled = (clipped - min_val) / denom * 255.0
-        return np.clip(scaled, 0, 255).astype(np.uint8)
-
-    def playVideoFrame(self, frame_position, cap, eyedat, scale_params=None):
+    def playVideoFrame(self, frame_position, cap, eyedat):
         if cap is None or not cap.isOpened():
             return None
         cap.set(cv2.CAP_PROP_POS_FRAMES, int(frame_position))
@@ -932,9 +1137,15 @@ class VideoAnalysisApp(QMainWindow):
         if not ret or frame is None:
             return None
 
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        normalized = self._apply_frame_scaling(gray, scale_params)
-        frame = np.stack((normalized,) * 3, axis=-1)
+        frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        frame = frame[:, :, 0]
+        p70 = np.percentile(frame, 70)
+        frame[frame >= p70] = p70
+        min_val = np.min(frame)
+        max_val = np.max(frame)
+        if max_val > min_val:
+            frame = (frame - min_val) / (max_val - min_val) * 255
+        frame = np.stack((frame,) * 3, axis=-1).astype(np.uint8)
         frame = self.overlay_plot(frame, int(frame_position), eyedat)
         return frame
 
@@ -955,6 +1166,14 @@ class VideoAnalysisApp(QMainWindow):
         self.show_pupil_overlay = bool(checked)
         if self.show_eye_videos and self.loaded:
             self.updateFrame()
+
+    def onMotionSmoothingChanged(self, value):
+        try:
+            self.motion_smoothing_secs = float(value)
+        except Exception:
+            self.motion_smoothing_secs = 0.5
+        if self.loaded:
+            self.plotTraces()
 
     def updateFrame(self):
         if not self.loaded:
@@ -979,7 +1198,6 @@ class VideoAnalysisApp(QMainWindow):
                 idx_frame,
                 self.left_video_cap,
                 self.left_eyedat,
-                self.left_video_scale_params,
             )
             if frame_left is not None:
                 image_left = QtGui.QImage(
@@ -993,7 +1211,6 @@ class VideoAnalysisApp(QMainWindow):
                 idx_frame,
                 self.right_video_cap,
                 self.right_eyedat,
-                self.right_video_scale_params,
             )
             if frame_right is not None:
                 image_right = QtGui.QImage(
@@ -1046,8 +1263,6 @@ class VideoAnalysisApp(QMainWindow):
                 except Exception:
                     pass
                 setattr(self, attr, None)
-        self.left_video_scale_params = None
-        self.right_video_scale_params = None
 
     def _open_eye_video_caps(self):
         self._close_eye_video_caps()
@@ -1065,59 +1280,7 @@ class VideoAnalysisApp(QMainWindow):
             )
             self._close_eye_video_caps()
             return False
-        self._prepare_video_scaling_params()
         return True
-
-    def _prepare_video_scaling_params(self):
-        self.left_video_scale_params = self._estimate_video_scaling(self.video_path_left)
-        self.right_video_scale_params = self._estimate_video_scaling(self.video_path_right)
-
-    def _estimate_video_scaling(self, video_path, sample_count=8):
-        cap = None
-        try:
-            cap = cv2.VideoCapture(video_path)
-            if not cap.isOpened():
-                return None
-            total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
-            if total_frames <= 0:
-                return None
-
-            rng = np.random.default_rng(0)
-            num_samples = min(sample_count, total_frames)
-            num_random = max(0, num_samples - 2)
-            random_positions = rng.choice(total_frames, size=num_random, replace=False) if num_random > 0 else np.array([], dtype=int)
-            extra_positions = np.array([0, max(total_frames - 1, 0)], dtype=int)
-            positions = np.unique(np.concatenate((extra_positions, random_positions)))
-
-            p70_vals = []
-            min_vals = []
-            max_vals = []
-            for pos in positions:
-                cap.set(cv2.CAP_PROP_POS_FRAMES, int(pos))
-                ret, frame = cap.read()
-                if not ret or frame is None:
-                    continue
-                gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-                min_vals.append(float(np.min(gray)))
-                max_vals.append(float(np.max(gray)))
-                p70_vals.append(float(np.percentile(gray, 70)))
-
-            if not p70_vals or not min_vals or not max_vals:
-                return None
-
-            min_val = float(np.min(min_vals))
-            max_val = float(np.max(max_vals))
-            if max_val <= min_val:
-                max_val = min_val + 1.0
-            p70 = float(np.median(p70_vals))
-            return (p70, min_val, max_val)
-        except Exception:
-            return None
-        finally:
-            try:
-                cap.release()
-            except Exception:
-                pass
 
     # -----------------------------
     # Playback
@@ -1180,13 +1343,12 @@ class VideoAnalysisApp(QMainWindow):
             except Exception:
                 pass
         self.span_selectors = []
-        self.selection_patches = []
 
         def make_on_select(ax):
             def on_select(xmin, xmax):
                 if not self.loaded or not self._selection_enabled():
                     return
-                self._set_selection_visual(ax, xmin, xmax)
+                self._set_selection_range(xmin, xmax, patch_ax=ax)
             return on_select
 
         selector_props = dict(alpha=0.0, facecolor='none', edgecolor='none', linewidth=0)
@@ -1203,19 +1365,179 @@ class VideoAnalysisApp(QMainWindow):
             selector.set_active(self._selection_enabled())
             self.span_selectors.append(selector)
 
-    def _set_selection_visual(self, ax, xmin, xmax):
-        if not self._selection_enabled():
-            return
-        if xmin > xmax:
-            xmin, xmax = xmax, xmin
-        self._clear_selection_visuals()
-        self.selection_range = (float(xmin), float(xmax))
+    def _normalize_selection_bounds(self, value_a, value_b):
+        try:
+            a_val = float(value_a)
+            b_val = float(value_b)
+        except Exception:
+            return None
+        start = min(a_val, b_val)
+        end = max(a_val, b_val)
+        if not np.isfinite(start) and np.isfinite(end):
+            start = end
+        if not np.isfinite(end) and np.isfinite(start):
+            end = start
+        if not np.isfinite(start):
+            return None
+        start = self._snap_time_to_epoch_edge(start)
+        end = self._snap_time_to_epoch_edge(end)
+        if start > end:
+            end = start
+        return start, end
 
-        patch = ax.axvspan(xmin, xmax, color='yellow', alpha=0.3)
+    def _snap_time_to_epoch_edge(self, value):
+        try:
+            t = float(value)
+        except Exception:
+            return 0.0
+        epoch_centers = getattr(self, "epoch_t", None)
+        if epoch_centers is None or epoch_centers.size == 0:
+            return t
+        edges = self._compute_epoch_edges(epoch_centers)
+        finite_edges = edges[np.isfinite(edges)]
+        if finite_edges.size == 0:
+            return t
+        idx = int(np.argmin(np.abs(finite_edges - t)))
+        return float(finite_edges[idx])
+
+    def _create_selection_patch(self, ax, start, end):
+        if ax is None:
+            return
+        self._remove_selection_patch()
+        try:
+            patch = ax.axvspan(start, end, color='yellow', alpha=0.3)
+        except Exception:
+            return
         self.selection_patch = patch
         self.selection_patches = [patch]
+        axis_index = None
+        try:
+            axis_index = list(self.figure.axes).index(ax)
+        except Exception:
+            axis_index = None
+        self._selection_patch_axis_index = axis_index
 
-        self.canvas.draw_idle()
+    def _remove_selection_patch(self):
+        if self.selection_patches:
+            for patch in self.selection_patches:
+                try:
+                    patch.remove()
+                except Exception:
+                    pass
+        self.selection_patches = []
+        if self.selection_patch is not None:
+            try:
+                self.selection_patch.remove()
+            except Exception:
+                pass
+        self.selection_patch = None
+        self._selection_patch_axis_index = None
+
+    def _set_selection_range(self, start, end, patch_ax=None):
+        bounds = self._normalize_selection_bounds(start, end)
+        if bounds is None:
+            return
+        start, end = bounds
+        self.selection_range = (start, end)
+        target_ax = patch_ax
+        axes = self.figure.axes
+        if target_ax is None and self._selection_patch_axis_index is not None:
+            if 0 <= self._selection_patch_axis_index < len(axes):
+                target_ax = axes[self._selection_patch_axis_index]
+        if target_ax is None and axes:
+            target_ax = axes[0]
+        if target_ax is not None:
+            self._create_selection_patch(target_ax, start, end)
+        self._sync_selection_lines_to_range()
+        if hasattr(self, "canvas") and self.canvas is not None:
+            self.canvas.draw_idle()
+
+    def _sync_selection_lines_to_range(self):
+        if self.selection_range is None:
+            base = self._snap_time_to_epoch_edge(self._current_time())
+            start = end = base
+        else:
+            start, end = self.selection_range
+        if self._selection_line_start is not None:
+            self._selection_line_start.set_x(start, trigger_callback=False)
+        if self._selection_line_end is not None:
+            self._selection_line_end.set_x(end, trigger_callback=False)
+
+    def _on_selection_line_changed(self, is_start, x):
+        if not np.isfinite(x):
+            return
+        if self.selection_range is None:
+            base = self._snap_time_to_epoch_edge(self._current_time())
+            current_start = current_end = base
+        else:
+            current_start, current_end = self.selection_range
+        if is_start:
+            start = self._snap_time_to_epoch_edge(x)
+            end = max(current_end, start)
+        else:
+            end = self._snap_time_to_epoch_edge(x)
+            start = min(current_start, end)
+        patch_ax = None
+        axes = self.figure.axes
+        if self._selection_patch_axis_index is not None and 0 <= self._selection_patch_axis_index < len(axes):
+            patch_ax = axes[self._selection_patch_axis_index]
+        self._set_selection_range(start, end, patch_ax=patch_ax)
+
+    def _setup_selection_vlines(self):
+        self._remove_selection_vlines()
+        axes = self.figure.axes
+        if not axes:
+            return
+        if self.selection_range is not None:
+            start, end = self.selection_range
+        else:
+            base = self._snap_time_to_epoch_edge(self._current_time())
+            start = end = base
+        self._selection_line_start = DraggableVLine(
+            axes,
+            start,
+            color="cyan",
+            linestyle="--",
+            linewidth=1.5,
+            tolerance_px=6,
+            on_changed=lambda x: self._on_selection_line_changed(True, x),
+            is_enabled_fn=self._selection_enabled,
+        )
+        self._selection_line_end = DraggableVLine(
+            axes,
+            end,
+            color="magenta",
+            linestyle="--",
+            linewidth=1.5,
+            tolerance_px=6,
+            on_changed=lambda x: self._on_selection_line_changed(False, x),
+            is_enabled_fn=self._selection_enabled,
+        )
+        self._sync_selection_lines_to_range()
+
+    def _remove_selection_vlines(self):
+        for vline in (self._selection_line_start, self._selection_line_end):
+            if vline is not None:
+                vline.disconnect()
+        self._selection_line_start = None
+        self._selection_line_end = None
+
+    def _restore_selection_patch(self):
+        if self.selection_range is None:
+            return
+        start, end = self.selection_range
+        axes = self.figure.axes
+        target_ax = None
+        if self._selection_patch_axis_index is not None and 0 <= self._selection_patch_axis_index < len(axes):
+            target_ax = axes[self._selection_patch_axis_index]
+        elif axes:
+            target_ax = axes[0]
+        if target_ax is None:
+            return
+        self._create_selection_patch(target_ax, start, end)
+        self._sync_selection_lines_to_range()
+        if hasattr(self, "canvas") and self.canvas is not None:
+            self.canvas.draw_idle()
 
     # -----------------------------
     # Helpers
@@ -1228,6 +1550,21 @@ class VideoAnalysisApp(QMainWindow):
         if sigma == 0 or not np.isfinite(sigma):
             return np.zeros_like(x)
         return (x - mu) / sigma
+
+    @staticmethod
+    def _smooth_signal(x, window_samples):
+        x = np.asarray(x, dtype=float)
+        if window_samples <= 1 or x.size == 0:
+            return x.copy()
+        kernel = int(window_samples)
+        if kernel <= 0:
+            return x.copy()
+        if kernel % 2 == 0:
+            kernel += 1
+        try:
+            return signal.medfilt(x, kernel_size=kernel)
+        except Exception:
+            return x.copy()
 
     @staticmethod
     def _adaptive_savgol(x, base_window=11, poly=3):
@@ -1470,7 +1807,8 @@ class VideoAnalysisApp(QMainWindow):
             with open(self.sleep_state_path, "wb") as f:
                 pickle.dump(sleep_state, f)
         except Exception as e:
-            QMessageBox.critical(self, "Save error", f"Failed to save sleep_state.pickle:\n{e}")
+            base_name = self._sleep_state_basename()
+            QMessageBox.critical(self, "Save error", f"Failed to save {base_name}:\n{e}")
             return
 
         self.loaded_sleep_state = sleep_state
@@ -1532,20 +1870,9 @@ class VideoAnalysisApp(QMainWindow):
                     pass
 
     def _clear_selection_visuals(self):
-        if self.selection_patches:
-            for patch in self.selection_patches:
-                try:
-                    patch.remove()
-                except Exception:
-                    pass
-        self.selection_patches = []
-        if self.selection_patch is not None:
-            try:
-                self.selection_patch.remove()
-            except Exception:
-                pass
-            self.selection_patch = None
+        self._remove_selection_patch()
         self.selection_range = None
+        self._sync_selection_lines_to_range()
         if hasattr(self, "canvas") and self.canvas is not None:
             self.canvas.draw_idle()
 
@@ -1909,7 +2236,11 @@ class VideoAnalysisApp(QMainWindow):
             and self.face_motion_10hz.size > 0
         ):
             motion_ax = ax2.twinx()
-            motion_vals = self._zscore_safe(self.face_motion_10hz)
+            motion_signal = self.face_motion_10hz
+            window_samples = max(1, int(round(self.motion_smoothing_secs * 10)))
+            if window_samples > 1:
+                motion_signal = self._smooth_signal(motion_signal, window_samples)
+            motion_vals = self._zscore_safe(motion_signal)
             motion_ax.plot(
                 self.face_motion_10hz_t,
                 motion_vals,
@@ -2022,7 +2353,9 @@ class VideoAnalysisApp(QMainWindow):
         # Draw state once (from current arrays)
         self._draw_state_axis(ax7)
 
-        # Vertical lines
+        self._setup_selection_vlines()
+
+        # Vertical lines (current playhead)
         self.vlines = []
         current_time = self._current_time()
         for ax in axs:
@@ -2030,6 +2363,7 @@ class VideoAnalysisApp(QMainWindow):
             self.vlines.append(vline)
 
         self._setup_span_selectors()
+        self._restore_selection_patch()
 
         # Threshold widgets (draggable lines + sliders)
         self._setup_threshold_widgets()
