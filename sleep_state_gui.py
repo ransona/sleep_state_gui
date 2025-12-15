@@ -1107,6 +1107,19 @@ class VideoAnalysisApp(QMainWindow):
         idx = max(0, min(int(idx), self.total_frames - 1))
         return float(self.emg_rms_10hz_t[idx])
 
+    def _move_cursor_to_time(self, time_value):
+        if not self.loaded or self.total_frames <= 0:
+            return
+        if not hasattr(self, "slider") or self.slider is None:
+            return
+        try:
+            target = float(time_value)
+        except Exception:
+            return
+        idx = int(np.argmin(np.abs(self.emg_rms_10hz_t - target)))
+        idx = max(0, min(idx, self.total_frames - 1))
+        self.slider.setValue(idx)
+
     # -----------------------------
     # Video overlay
     # -----------------------------
@@ -1451,6 +1464,7 @@ class VideoAnalysisApp(QMainWindow):
         self._sync_selection_lines_to_range()
         if hasattr(self, "canvas") and self.canvas is not None:
             self.canvas.draw_idle()
+        self._move_cursor_to_time(start)
 
     def _sync_selection_lines_to_range(self):
         if self.selection_range is None:
@@ -1718,8 +1732,6 @@ class VideoAnalysisApp(QMainWindow):
 
         mask_10 = (self.state_10hz_t >= tmin) & (self.state_10hz_t <= tmax)
         self.state_10hz[mask_10] = int(state_value)
-
-        self._clear_selection_visuals()
 
         self._state_dirty = True
         self._update_save_button_state()
