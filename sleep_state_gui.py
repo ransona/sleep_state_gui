@@ -1358,8 +1358,8 @@ class VideoAnalysisApp(QMainWindow):
                 ax,
                 make_on_select(ax),
                 direction='horizontal',
-                useblit=True,
-                interactive=True,
+                useblit=False,
+                interactive=False,
                 props=selector_props,
             )
             selector.set_active(self._selection_enabled())
