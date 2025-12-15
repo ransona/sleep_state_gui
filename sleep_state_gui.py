@@ -2,6 +2,7 @@ import sys
 import os
 import pickle
 import shutil
+import time
 import cv2
 import numpy as np
 
@@ -198,6 +199,11 @@ class VideoAnalysisApp(QMainWindow):
         self.epoch_features_data = None
         self.loaded_sleep_state = None
         self.sleep_state_path = None
+        self.left_video_cap = None
+        self.right_video_cap = None
+        self.left_video_scale_params = None
+        self.right_video_scale_params = None
+        self.debug_frame_timing = True
         self._state_dirty = False
         self.selection_patches = []
         self.available_state_values = set()
@@ -421,6 +427,7 @@ class VideoAnalysisApp(QMainWindow):
     # Load data
     # -----------------------------
     def loadData(self):
+        self._close_eye_video_caps()
         self.userID = self.userIdEdit.text().strip()
         self.expID = self.expIdEdit.text().strip()
         if not self.userID or not self.expID:
@@ -455,6 +462,9 @@ class VideoAnalysisApp(QMainWindow):
             except Exception:
                 QMessageBox.critical(self, "File Error", "Eye videos not found. Please check the paths.")
                 return
+
+        if not self._open_eye_video_caps():
+            return
 
         # eye data (read-only)
         try:
@@ -899,23 +909,32 @@ class VideoAnalysisApp(QMainWindow):
         frame = cv2.circle(frame, center, radius, color, 2)
         return frame
 
-    def playVideoFrame(self, frame_position, video_path, eyedat):
-        cap = cv2.VideoCapture(video_path)
+    def _apply_frame_scaling(self, gray_frame, scale_params):
+        gray = np.asarray(gray_frame, dtype=float)
+        if scale_params is None:
+            p70 = np.percentile(gray, 70)
+            min_val = float(np.min(gray))
+            max_val = float(np.max(gray))
+        else:
+            p70, min_val, max_val = scale_params
+        clipped = np.minimum(gray, p70)
+        denom = max_val - min_val
+        if denom <= 0:
+            denom = 1.0
+        scaled = (clipped - min_val) / denom * 255.0
+        return np.clip(scaled, 0, 255).astype(np.uint8)
+
+    def playVideoFrame(self, frame_position, cap, eyedat, scale_params=None):
+        if cap is None or not cap.isOpened():
+            return None
         cap.set(cv2.CAP_PROP_POS_FRAMES, int(frame_position))
         ret, frame = cap.read()
-        cap.release()
-        if not ret:
+        if not ret or frame is None:
             return None
 
-        frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        frame = frame[:, :, 0]
-        p70 = np.percentile(frame, 70)
-        frame[frame >= p70] = p70
-        min_val = np.min(frame)
-        max_val = np.max(frame)
-        if max_val > min_val:
-            frame = (frame - min_val) / (max_val - min_val) * 255
-        frame = np.stack((frame,) * 3, axis=-1).astype(np.uint8)
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        normalized = self._apply_frame_scaling(gray, scale_params)
+        frame = np.stack((normalized,) * 3, axis=-1)
         frame = self.overlay_plot(frame, int(frame_position), eyedat)
         return frame
 
@@ -941,7 +960,14 @@ class VideoAnalysisApp(QMainWindow):
         if not self.loaded:
             return
 
+        start_total = time.perf_counter()
+        timings = []
+        last = start_total
+
         t = self._current_time()
+        now = time.perf_counter()
+        timings.append(("time_lookup", now - last))
+        last = now
 
         if self.show_eye_videos:
             if self.eye_frame_times is not None and self.eye_frame_times.size > 0:
@@ -949,7 +975,12 @@ class VideoAnalysisApp(QMainWindow):
             else:
                 idx_frame = 0
 
-            frame_left = self.playVideoFrame(idx_frame, self.video_path_left, self.left_eyedat)
+            frame_left = self.playVideoFrame(
+                idx_frame,
+                self.left_video_cap,
+                self.left_eyedat,
+                self.left_video_scale_params,
+            )
             if frame_left is not None:
                 image_left = QtGui.QImage(
                     frame_left.data, frame_left.shape[1], frame_left.shape[0],
@@ -958,7 +989,12 @@ class VideoAnalysisApp(QMainWindow):
                 pixmap_left = QtGui.QPixmap.fromImage(image_left)
                 self.leftVideoLabel.setPixmap(pixmap_left.scaled(self.leftVideoLabel.size(), Qt.KeepAspectRatio))
 
-            frame_right = self.playVideoFrame(idx_frame, self.video_path_right, self.right_eyedat)
+            frame_right = self.playVideoFrame(
+                idx_frame,
+                self.right_video_cap,
+                self.right_eyedat,
+                self.right_video_scale_params,
+            )
             if frame_right is not None:
                 image_right = QtGui.QImage(
                     frame_right.data, frame_right.shape[1], frame_right.shape[0],
@@ -966,11 +1002,18 @@ class VideoAnalysisApp(QMainWindow):
                 )
                 pixmap_right = QtGui.QPixmap.fromImage(image_right)
                 self.rightVideoLabel.setPixmap(pixmap_right.scaled(self.rightVideoLabel.size(), Qt.KeepAspectRatio))
+
+            video_end = time.perf_counter()
+            timings.append(("video_render", video_end - last))
+            last = video_end
         else:
             if self.leftVideoLabel is not None:
                 self.leftVideoLabel.clear()
             if self.rightVideoLabel is not None:
                 self.rightVideoLabel.clear()
+            video_end = time.perf_counter()
+            timings.append(("video_hidden", video_end - last))
+            last = video_end
 
         if self.vlines:
             for vline in self.vlines:
@@ -979,9 +1022,102 @@ class VideoAnalysisApp(QMainWindow):
                 except Exception:
                     pass
             self.canvas.draw_idle()
+        vline_end = time.perf_counter()
+        timings.append(("vline_update", vline_end - last))
+        last = vline_end
 
         if self.frameJumpEdit.isEnabled():
             self.frameJumpEdit.setText(f"{t:.3f}")
+        frame_text_end = time.perf_counter()
+        timings.append(("frame_text", frame_text_end - last))
+        last = frame_text_end
+
+        total_elapsed = time.perf_counter() - start_total
+        if self.debug_frame_timing:
+            detail = " | ".join(f"{name}={duration*1000:.1f}ms" for name, duration in timings)
+            print(f"[DEBUG] updateFrame times: {detail} | total={total_elapsed*1000:.1f}ms")
+
+    def _close_eye_video_caps(self):
+        for attr in ("left_video_cap", "right_video_cap"):
+            cap = getattr(self, attr, None)
+            if cap is not None:
+                try:
+                    cap.release()
+                except Exception:
+                    pass
+                setattr(self, attr, None)
+        self.left_video_scale_params = None
+        self.right_video_scale_params = None
+
+    def _open_eye_video_caps(self):
+        self._close_eye_video_caps()
+        self.left_video_cap = cv2.VideoCapture(self.video_path_left)
+        self.right_video_cap = cv2.VideoCapture(self.video_path_right)
+
+        if (
+            not self.left_video_cap.isOpened()
+            or not self.right_video_cap.isOpened()
+        ):
+            QMessageBox.critical(
+                self,
+                "Video Error",
+                "Unable to open one or both eye videos. Please verify the files.",
+            )
+            self._close_eye_video_caps()
+            return False
+        self._prepare_video_scaling_params()
+        return True
+
+    def _prepare_video_scaling_params(self):
+        self.left_video_scale_params = self._estimate_video_scaling(self.video_path_left)
+        self.right_video_scale_params = self._estimate_video_scaling(self.video_path_right)
+
+    def _estimate_video_scaling(self, video_path, sample_count=8):
+        cap = None
+        try:
+            cap = cv2.VideoCapture(video_path)
+            if not cap.isOpened():
+                return None
+            total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+            if total_frames <= 0:
+                return None
+
+            rng = np.random.default_rng(0)
+            num_samples = min(sample_count, total_frames)
+            num_random = max(0, num_samples - 2)
+            random_positions = rng.choice(total_frames, size=num_random, replace=False) if num_random > 0 else np.array([], dtype=int)
+            extra_positions = np.array([0, max(total_frames - 1, 0)], dtype=int)
+            positions = np.unique(np.concatenate((extra_positions, random_positions)))
+
+            p70_vals = []
+            min_vals = []
+            max_vals = []
+            for pos in positions:
+                cap.set(cv2.CAP_PROP_POS_FRAMES, int(pos))
+                ret, frame = cap.read()
+                if not ret or frame is None:
+                    continue
+                gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                min_vals.append(float(np.min(gray)))
+                max_vals.append(float(np.max(gray)))
+                p70_vals.append(float(np.percentile(gray, 70)))
+
+            if not p70_vals or not min_vals or not max_vals:
+                return None
+
+            min_val = float(np.min(min_vals))
+            max_val = float(np.max(max_vals))
+            if max_val <= min_val:
+                max_val = min_val + 1.0
+            p70 = float(np.median(p70_vals))
+            return (p70, min_val, max_val)
+        except Exception:
+            return None
+        finally:
+            try:
+                cap.release()
+            except Exception:
+                pass
 
     # -----------------------------
     # Playback
@@ -1001,6 +1137,10 @@ class VideoAnalysisApp(QMainWindow):
             self.slider.setValue(self.slider.value() + 1)
         else:
             self.stopPlayback()
+
+    def closeEvent(self, event):
+        self._close_eye_video_caps()
+        super().closeEvent(event)
 
     # -----------------------------
     # Navigation
