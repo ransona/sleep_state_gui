@@ -275,6 +275,162 @@ class ScoringProgressDialog(QtWidgets.QDialog):
         self.progressBar.setValue(int(round(frac * 100)))
         QApplication.processEvents()
 
+class ThresholdHistogramDialog(QtWidgets.QDialog):
+    METRIC_CONFIG = [
+        ("emg", "EMG RMS mean", "emg_rms_mean_by_epoch", "emg_rms_threshold", "tab:blue"),
+        ("ratio", "Smoothed θ/δ ratio", "theta_delta_ratio_smoothed", "theta_delta_ratio_threshold", "tab:green"),
+        ("delta", "Smoothed delta power", "delta_power_smoothed", "delta_power_threshold", "tab:red"),
+    ]
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.app = parent
+        self.setWindowTitle("Threshold distributions")
+        self.setMinimumSize(580, 720)
+        layout = QVBoxLayout()
+        layout.setContentsMargins(8, 8, 8, 8)
+        self.setLayout(layout)
+        self.figure = Figure(figsize=(6, 8))
+        self.canvas = FigureCanvas(self.figure)
+        layout.addWidget(self.canvas)
+        self._threshold_lines = {}
+        self._threshold_texts = {}
+        self._config_by_metric = {
+            metric: (label, data_attr, thr_attr, color)
+            for metric, label, data_attr, thr_attr, color in self.METRIC_CONFIG
+        }
+
+    def refresh(self):
+        if not getattr(self.app, "loaded", False):
+            return
+        self._disconnect_lines()
+        self.figure.clf()
+        axes = self.figure.subplots(len(self.METRIC_CONFIG), 1, sharex=False)
+        if isinstance(axes, np.ndarray):
+            axes = axes.flatten().tolist()
+        elif not isinstance(axes, list):
+            axes = [axes]
+
+        for ax, (metric, label, data_attr, thr_attr, color) in zip(axes, self.METRIC_CONFIG):
+            ax.clear()
+            data = getattr(self.app, data_attr, None)
+            arr = np.asarray(data, dtype=float) if data is not None else np.array([], dtype=float)
+            finite = arr[np.isfinite(arr)]
+            if finite.size > 0:
+                bins = self._choose_bins(finite.size)
+                ax.hist(
+                    finite,
+                    bins=bins,
+                    color=color,
+                    edgecolor="k",
+                    linewidth=0.4,
+                    alpha=0.65,
+                )
+            else:
+                ax.text(
+                    0.5,
+                    0.5,
+                    "No finite data",
+                    transform=ax.transAxes,
+                    ha="center",
+                    va="center",
+                    fontsize=9,
+                    color="gray",
+                )
+
+            threshold = self._current_threshold_value(metric)
+            line = DraggableVLine(
+                [ax],
+                threshold,
+                color=color,
+                linestyle="--",
+                linewidth=1.5,
+                tolerance_px=8,
+                on_changed=lambda val, mk=metric: self._on_line_changed(mk, val),
+            )
+            self._threshold_lines[metric] = line
+            txt = ax.text(
+                0.98,
+                0.95,
+                f"thr={threshold:.2f}",
+                transform=ax.transAxes,
+                ha="right",
+                va="top",
+                fontsize=8,
+            )
+            self._threshold_texts[metric] = txt
+            ax.set_title(label, fontsize=10)
+            ax.set_ylabel("Count", fontsize=8)
+            ax.grid(True, linestyle=":", alpha=0.4)
+            self._extend_xlim(ax, finite, threshold)
+
+        self.figure.tight_layout(pad=1.0)
+        self.canvas.draw_idle()
+
+    def sync_thresholds(self):
+        if not self._threshold_lines:
+            return
+        for metric, line in self._threshold_lines.items():
+            if line is None:
+                continue
+            value = self._current_threshold_value(metric)
+            line.set_x(value, trigger_callback=False)
+            text = self._threshold_texts.get(metric)
+            if text is not None:
+                text.set_text(f"thr={value:.2f}")
+        self.canvas.draw_idle()
+
+    def update_metric_text(self, metric_key, value):
+        text = self._threshold_texts.get(metric_key)
+        if text is not None:
+            text.set_text(f"thr={value:.2f}")
+            self.canvas.draw_idle()
+
+    def _on_line_changed(self, metric_key, value):
+        if not hasattr(self.app, "_apply_threshold_from_histogram"):
+            return
+        self.app._apply_threshold_from_histogram(metric_key, value)
+
+    def _disconnect_lines(self):
+        for line in self._threshold_lines.values():
+            try:
+                line.disconnect()
+            except Exception:
+                pass
+        self._threshold_lines.clear()
+        self._threshold_texts.clear()
+
+    def _choose_bins(self, count):
+        return max(12, min(80, int(np.sqrt(count) * 2)))
+
+    def _current_threshold_value(self, metric_key):
+        config = self._config_by_metric.get(metric_key)
+        if config is None:
+            return 0.0
+        _, data_attr, thr_attr, _ = config
+        threshold = getattr(self.app, thr_attr, np.nan)
+        if np.isfinite(threshold):
+            return float(threshold)
+        data = getattr(self.app, data_attr, None)
+        arr = np.asarray(data, dtype=float) if data is not None else np.array([], dtype=float)
+        finite = arr[np.isfinite(arr)]
+        if finite.size > 0:
+            return float(np.nanmedian(finite))
+        return 0.0
+
+    def _extend_xlim(self, ax, data, threshold):
+        if data.size == 0:
+            return
+        lo, hi = ax.get_xlim()
+        span = max(hi - lo, 1e-6)
+        if threshold < lo:
+            lo = threshold - 0.05 * span
+        elif threshold > hi:
+            hi = threshold + 0.05 * span
+        ax.set_xlim(lo, hi)
+
+
+
 # -----------------------------
 # GUI
 # -----------------------------
@@ -358,6 +514,7 @@ class VideoAnalysisApp(QMainWindow):
         self.wheel_speed_mean_by_epoch = None
         self.theta_delta_ratio_smoothed = None
         self.delta_power_smoothed = None
+        self._histogram_dialog = None
 
         self.initUI()
 
@@ -504,6 +661,11 @@ class VideoAnalysisApp(QMainWindow):
         self.rescoreButton.setEnabled(False)
         self.rescoreButton.clicked.connect(self.onRescoreClicked)
         satLayout.addWidget(self.rescoreButton)
+
+        self.histogramButton = QPushButton("Show distributions")
+        self.histogramButton.setEnabled(False)
+        self.histogramButton.clicked.connect(self.show_threshold_histogram_dialog)
+        satLayout.addWidget(self.histogramButton)
 
         self.saveButton = QPushButton("Save scoring")
         self.saveButton.setEnabled(False)
@@ -983,6 +1145,7 @@ class VideoAnalysisApp(QMainWindow):
         self.autoRescoreCheck.setEnabled(True)
         self.autoRescoreCheck.setChecked(False)
         self.rescoreButton.setEnabled(True)
+        self.histogramButton.setEnabled(True)
         self.saveButton.setEnabled(False)
         self.showVideosCheck.setEnabled(True)
         self.showOverlayCheck.setEnabled(True)
@@ -1716,6 +1879,7 @@ class VideoAnalysisApp(QMainWindow):
             theta_delta_ratio_smoothed=self.theta_delta_ratio_smoothed,
             delta_power_smoothed=self.delta_power_smoothed,
         )
+        self._refresh_threshold_histogram_dialog()
 
     # -----------------------------
     # Manual state assignment (no functionality loss)
@@ -1857,6 +2021,51 @@ class VideoAnalysisApp(QMainWindow):
         if self._auto_rescore_enabled():
             self.rerun_classification()
 
+    def show_threshold_histogram_dialog(self):
+        if not self.loaded:
+            QMessageBox.warning(self, "Threshold histograms", "Load sleep scoring data before viewing distributions.")
+            return
+        if self._histogram_dialog is None:
+            self._histogram_dialog = ThresholdHistogramDialog(self)
+        self._histogram_dialog.refresh()
+        self._histogram_dialog.show()
+        self._histogram_dialog.raise_()
+
+    def _apply_threshold_from_histogram(self, metric_key, value):
+        attr_map = {
+            "emg": "emg_rms_threshold",
+            "ratio": "theta_delta_ratio_threshold",
+            "delta": "delta_power_threshold",
+        }
+        attr = attr_map.get(metric_key)
+        if attr is None:
+            return
+        try:
+            new_val = float(value)
+        except Exception:
+            return
+
+        setattr(self, attr, new_val)
+        auto_enabled = self._auto_rescore_enabled()
+        self._sync_threshold_widgets_to_values()
+        self._handle_threshold_change()
+        if not auto_enabled:
+            self.rerun_classification()
+        if self._histogram_dialog is not None:
+            self._histogram_dialog.update_metric_text(metric_key, new_val)
+
+    def _sync_threshold_histogram_dialog(self):
+        dialog = getattr(self, "_histogram_dialog", None)
+        if dialog is None or not dialog.isVisible():
+            return
+        dialog.sync_thresholds()
+
+    def _refresh_threshold_histogram_dialog(self):
+        dialog = getattr(self, "_histogram_dialog", None)
+        if dialog is None or not dialog.isVisible():
+            return
+        dialog.refresh()
+
     def _update_save_button_state(self):
         if hasattr(self, "saveButton") and self.saveButton is not None:
             self.saveButton.setEnabled(self.loaded and self._state_dirty)
@@ -1969,6 +2178,7 @@ class VideoAnalysisApp(QMainWindow):
             pass
         finally:
             self._syncing_slider = False
+        self._sync_threshold_histogram_dialog()
 
     def _disconnect_threshold_widgets(self):
         for obj in [self._thr_drag_emg, self._thr_drag_wheel, self._thr_drag_ratio]:
