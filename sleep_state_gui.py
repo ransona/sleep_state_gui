@@ -278,8 +278,8 @@ class ScoringProgressDialog(QtWidgets.QDialog):
 class ThresholdHistogramDialog(QtWidgets.QDialog):
     METRIC_CONFIG = [
         ("emg", "EMG RMS mean", "emg_rms_mean_by_epoch", "emg_rms_threshold", "tab:blue"),
-        ("ratio", "Smoothed θ/δ ratio", "theta_delta_ratio_smoothed", "theta_delta_ratio_threshold", "tab:green"),
-        ("delta", "Smoothed delta power", "delta_power_smoothed", "delta_power_threshold", "tab:red"),
+        ("low_freq", "Low-frequency power", "low_freq_power_smoothed", "low_freq_threshold", "tab:orange"),
+        ("ratio", "Smoothed θ ratio", "theta_delta_ratio_smoothed", "theta_delta_ratio_threshold", "tab:green"),
     ]
 
     def __init__(self, parent=None):
@@ -460,7 +460,7 @@ class VideoAnalysisApp(QMainWindow):
 
         # thresholds
         self.emg_rms_threshold = None
-        self.wheel_speed_threshold = None
+        self.low_freq_threshold = None
         self.theta_delta_ratio_threshold = None
         self.delta_power_threshold = None
 
@@ -495,16 +495,16 @@ class VideoAnalysisApp(QMainWindow):
 
         self._axs = None
         self._ax_emg = None
-        self._ax_wheel = None
+        self._ax_low_freq = None
         self._ax_ratio = None
         self._ax_state = None
 
         self._thr_drag_emg = None
-        self._thr_drag_wheel = None
+        self._thr_drag_low_freq = None
         self._thr_drag_ratio = None
 
         self._slider_emg = None
-        self._slider_wheel = None
+        self._slider_low_freq = None
         self._slider_ratio = None
 
         self._syncing_slider = False
@@ -514,6 +514,8 @@ class VideoAnalysisApp(QMainWindow):
         self.wheel_speed_mean_by_epoch = None
         self.theta_delta_ratio_smoothed = None
         self.delta_power_smoothed = None
+        self.low_freq_power = None
+        self.low_freq_power_smoothed = None
         self._histogram_dialog = None
 
         self.initUI()
@@ -1046,18 +1048,34 @@ class VideoAnalysisApp(QMainWindow):
 
         # thresholds
         self.emg_rms_threshold = float(sleep_state.get('emg_rms_threshold', np.nan))
-        self.wheel_speed_threshold = float(sleep_state.get('wheel_speed_threshold', np.nan))
-        self.theta_delta_ratio_threshold = float(sleep_state.get('theta_delta_ratio_threshold', np.nan))
-        self.delta_power_threshold = float(sleep_state.get('delta_power_threshold', np.nan))
+        theta_ratio_thr = sleep_state.get('theta_ratio_threshold')
+        if theta_ratio_thr is None:
+            theta_ratio_thr = sleep_state.get('theta_delta_ratio_threshold')
+        self.theta_delta_ratio_threshold = float(theta_ratio_thr if theta_ratio_thr is not None else np.nan)
 
-        if not np.isfinite(self.wheel_speed_threshold):
-            self.wheel_speed_threshold = 1.0
+        low_freq_candidates = [
+            sleep_state.get("low_freq_threshold"),
+            sleep_state.get("delta_power_threshold"),
+            sleep_state.get("wheel_speed_threshold"),
+        ]
+        low_freq_thr = next(
+            (float(val) for val in low_freq_candidates if val is not None and np.isfinite(float(val))),
+            float(np.nan),
+        )
+        if not np.isfinite(low_freq_thr):
+            stored_low_freq = np.asarray(sleep_state.get("low_freq_power", []), dtype=float)
+            finite_low = stored_low_freq[np.isfinite(stored_low_freq)]
+            if finite_low.size > 0:
+                low_freq_thr = float(np.nanmedian(finite_low))
+            else:
+                low_freq_thr = 0.0
+        self.low_freq_threshold = float(low_freq_thr)
+        self.delta_power_threshold = float(self.low_freq_threshold)
+
         if not np.isfinite(self.emg_rms_threshold):
             self.emg_rms_threshold = float(np.nanmedian(self.emg_rms_10hz))
         if not np.isfinite(self.theta_delta_ratio_threshold):
             self.theta_delta_ratio_threshold = 2.0
-        if not np.isfinite(self.delta_power_threshold):
-            self.delta_power_threshold = float(np.nanmean(self.delta_power))
 
         stored_features = sleep_state.get("epoch_features")
         self.epoch_features_data = None
@@ -1069,6 +1087,9 @@ class VideoAnalysisApp(QMainWindow):
                 }
             except Exception:
                 self.epoch_features_data = None
+
+        self.low_freq_power = np.asarray(sleep_state.get("low_freq_power", []), dtype=float)
+        self.low_freq_power_smoothed = np.asarray(sleep_state.get("low_freq_power_smoothed", []), dtype=float)
 
         # fallback labels
         if self.state_label_map is None and 'state_labels' in sleep_state:
@@ -1850,6 +1871,12 @@ class VideoAnalysisApp(QMainWindow):
             self.delta_power_smoothed = np.asarray(
                 stored.get("delta_power_smoothed", []), dtype=float
             )
+            self.low_freq_power = np.asarray(
+                stored.get("low_freq_power", []), dtype=float
+            )
+            self.low_freq_power_smoothed = np.asarray(
+                stored.get("low_freq_power_smoothed", []), dtype=float
+            )
             return
 
         # Epoch means for EMG RMS and wheel from 10Hz traces
@@ -1868,6 +1895,8 @@ class VideoAnalysisApp(QMainWindow):
 
         self.theta_delta_ratio_smoothed = self._adaptive_savgol(ratio, base_window=11)
         self.delta_power_smoothed = self._adaptive_savgol(delta_power, base_window=11)
+        self.low_freq_power = np.array([], dtype=float)
+        self.low_freq_power_smoothed = np.array([], dtype=float)
 
         self.epoch_features_data = build_epoch_feature_dict(
             self.epoch_t,
@@ -1912,9 +1941,10 @@ class VideoAnalysisApp(QMainWindow):
             self._rebuild_epoch_features()
         thresholds = {
             "emg_rms_threshold": float(self.emg_rms_threshold),
-            "wheel_speed_threshold": float(self.wheel_speed_threshold),
+            "theta_ratio_threshold": float(self.theta_delta_ratio_threshold),
             "theta_delta_ratio_threshold": float(self.theta_delta_ratio_threshold),
-            "delta_power_threshold": float(self.delta_power_threshold),
+            "low_freq_threshold": float(self.low_freq_threshold),
+            "delta_power_threshold": float(self.low_freq_threshold),
         }
         try:
             state_epoch, _ = score_from_epoch_features(
@@ -1969,9 +1999,11 @@ class VideoAnalysisApp(QMainWindow):
         sleep_state["state_10hz_t"] = np.asarray(self.state_10hz_t, dtype=np.float64)
 
         sleep_state["emg_rms_threshold"] = float(self.emg_rms_threshold)
-        sleep_state["wheel_speed_threshold"] = float(self.wheel_speed_threshold)
+        sleep_state["theta_ratio_threshold"] = float(self.theta_delta_ratio_threshold)
         sleep_state["theta_delta_ratio_threshold"] = float(self.theta_delta_ratio_threshold)
-        sleep_state["delta_power_threshold"] = float(self.delta_power_threshold)
+        sleep_state["low_freq_threshold"] = float(self.low_freq_threshold)
+        sleep_state["delta_power_threshold"] = float(self.low_freq_threshold)
+        sleep_state["wheel_speed_threshold"] = float(self.low_freq_threshold)
 
         if self.epoch_features_data is not None:
             sleep_state["epoch_features"] = {
@@ -2035,7 +2067,7 @@ class VideoAnalysisApp(QMainWindow):
         attr_map = {
             "emg": "emg_rms_threshold",
             "ratio": "theta_delta_ratio_threshold",
-            "delta": "delta_power_threshold",
+            "low_freq": "low_freq_threshold",
         }
         attr = attr_map.get(metric_key)
         if attr is None:
@@ -2083,7 +2115,7 @@ class VideoAnalysisApp(QMainWindow):
         if not selection_active:
             self._clear_selection_visuals()
         slider_active = self._threshold_edit_enabled()
-        for slider in [self._slider_emg, self._slider_wheel, self._slider_ratio]:
+        for slider in [self._slider_emg, self._slider_low_freq, self._slider_ratio]:
             if slider is not None:
                 try:
                     slider.set_active(slider_active)
@@ -2154,7 +2186,7 @@ class VideoAnalysisApp(QMainWindow):
     def _sync_threshold_widgets_to_values(self):
         if (
             self._thr_drag_emg is None
-            and self._thr_drag_wheel is None
+            and self._thr_drag_low_freq is None
             and self._thr_drag_ratio is None
         ):
             return
@@ -2165,10 +2197,10 @@ class VideoAnalysisApp(QMainWindow):
             if self._slider_emg is not None:
                 self._slider_emg.set_val(float(self.emg_rms_threshold))
 
-            if self._thr_drag_wheel is not None:
-                self._thr_drag_wheel.set_y(float(self.wheel_speed_threshold), trigger_callback=False)
-            if self._slider_wheel is not None:
-                self._slider_wheel.set_val(float(self.wheel_speed_threshold))
+            if self._thr_drag_low_freq is not None:
+                self._thr_drag_low_freq.set_y(float(self.low_freq_threshold), trigger_callback=False)
+            if self._slider_low_freq is not None:
+                self._slider_low_freq.set_val(float(self.low_freq_threshold))
 
             if self._thr_drag_ratio is not None:
                 self._thr_drag_ratio.set_y(float(self.theta_delta_ratio_threshold), trigger_callback=False)
@@ -2181,17 +2213,17 @@ class VideoAnalysisApp(QMainWindow):
         self._sync_threshold_histogram_dialog()
 
     def _disconnect_threshold_widgets(self):
-        for obj in [self._thr_drag_emg, self._thr_drag_wheel, self._thr_drag_ratio]:
+        for obj in [self._thr_drag_emg, self._thr_drag_low_freq, self._thr_drag_ratio]:
             if obj is not None:
                 try:
                     obj.disconnect()
                 except Exception:
                     pass
         self._thr_drag_emg = None
-        self._thr_drag_wheel = None
+        self._thr_drag_low_freq = None
         self._thr_drag_ratio = None
         self._slider_emg = None
-        self._slider_wheel = None
+        self._slider_low_freq = None
         self._slider_ratio = None
 
     def _setup_threshold_widgets(self):
@@ -2201,7 +2233,7 @@ class VideoAnalysisApp(QMainWindow):
         """
         self._disconnect_threshold_widgets()
 
-        if self._ax_emg is None or self._ax_ratio is None or self._ax_wheel is None:
+        if self._ax_emg is None or self._ax_ratio is None or self._ax_low_freq is None:
             return
 
         fig = self.figure
@@ -2211,7 +2243,7 @@ class VideoAnalysisApp(QMainWindow):
 
         # Slider axes (normalized figure coords)
         ax_s_emg = fig.add_axes([0.08, 0.91, 0.28, 0.03])
-        ax_s_wheel = fig.add_axes([0.40, 0.91, 0.28, 0.03])
+        ax_s_low_freq = fig.add_axes([0.40, 0.91, 0.28, 0.03])
         ax_s_ratio = fig.add_axes([0.72, 0.91, 0.20, 0.03])
 
         # Data-driven slider ranges
@@ -2226,15 +2258,21 @@ class VideoAnalysisApp(QMainWindow):
         emg_min = 0.0
         emg_max = max(emg_max * 1.05, emg_min + 1e-6)
 
-        wheel_vals = self.wheel_speed_mean_by_epoch
-        if wheel_vals is None:
-            wheel_vals = np.asarray(self.wheel_10hz, dtype=float)
-        wheel_finite = wheel_vals[np.isfinite(wheel_vals)]
-        if wheel_finite.size > 0:
-            wheel_max = float(np.nanmax(np.abs(wheel_finite)))
+        low_freq_vals = self.low_freq_power
+        if low_freq_vals is None or low_freq_vals.size == 0:
+            low_freq_vals = np.asarray(self.low_freq_power_smoothed, dtype=float)
+        low_freq_finite = low_freq_vals[np.isfinite(low_freq_vals)]
+        if low_freq_finite.size > 0:
+            low_freq_min = float(np.nanmin(low_freq_finite))
+            low_freq_max = float(np.nanmax(low_freq_finite))
         else:
-            wheel_max = max(0.1, abs(float(self.wheel_speed_threshold)))
-        wheel_max = max(wheel_max * 1.05, 0.1)
+            fallback_span = abs(float(self.low_freq_threshold)) if np.isfinite(self.low_freq_threshold) else 1.0
+            low_freq_min = -fallback_span
+            low_freq_max = fallback_span
+        low_freq_max = max(low_freq_max, low_freq_min + 1e-6)
+        span = low_freq_max - low_freq_min
+        if span <= 0:
+            low_freq_max = low_freq_min + 1e-6
 
         ratio_vals = np.asarray(self.theta_delta_ratio_smoothed, dtype=float)
         ratio_finite = ratio_vals[np.isfinite(ratio_vals)]
@@ -2258,14 +2296,14 @@ class VideoAnalysisApp(QMainWindow):
                     self._syncing_slider = False
             self._handle_threshold_change()
 
-        def on_wheel_drag(y):
+        def on_low_freq_drag(y):
             if self._syncing_slider:
                 return
-            self.wheel_speed_threshold = float(y)
-            if self._slider_wheel is not None:
+            self.low_freq_threshold = float(y)
+            if self._slider_low_freq is not None:
                 self._syncing_slider = True
                 try:
-                    self._slider_wheel.set_val(float(y))
+                    self._slider_low_freq.set_val(float(y))
                 finally:
                     self._syncing_slider = False
             self._handle_threshold_change()
@@ -2294,14 +2332,14 @@ class VideoAnalysisApp(QMainWindow):
             is_enabled_fn=self._threshold_edit_enabled,
         )
 
-        self._thr_drag_wheel = DraggableHLine(
-            self._ax_wheel,
-            float(self.wheel_speed_threshold),
+        self._thr_drag_low_freq = DraggableHLine(
+            self._ax_low_freq,
+            float(self.low_freq_threshold),
             color="tab:orange",
             linestyle="--",
             linewidth=1.5,
             tolerance_px=7,
-            on_changed=on_wheel_drag,
+            on_changed=on_low_freq_drag,
             is_enabled_fn=self._threshold_edit_enabled,
         )
 
@@ -2338,23 +2376,23 @@ class VideoAnalysisApp(QMainWindow):
                 self._syncing_slider = False
             self._handle_threshold_change()
 
-        def on_wheel_slider(val):
+        def on_low_freq_slider(val):
             if self._syncing_slider:
                 return
             if not self._threshold_edit_enabled():
                 self._syncing_slider = True
                 try:
-                    if self._slider_wheel is not None:
-                        self._slider_wheel.set_val(float(self.wheel_speed_threshold))
+                    if self._slider_low_freq is not None:
+                        self._slider_low_freq.set_val(float(self.low_freq_threshold))
                 finally:
                     self._syncing_slider = False
                 return
             self._syncing_slider = True
             try:
                 new_val = float(val)
-                self.wheel_speed_threshold = new_val
-                if self._thr_drag_wheel is not None:
-                    self._thr_drag_wheel.set_y(new_val, trigger_callback=False)
+                self.low_freq_threshold = new_val
+                if self._thr_drag_low_freq is not None:
+                    self._thr_drag_low_freq.set_y(new_val, trigger_callback=False)
             finally:
                 self._syncing_slider = False
             self._handle_threshold_change()
@@ -2383,13 +2421,19 @@ class VideoAnalysisApp(QMainWindow):
         # Create sliders
         self._slider_emg = Slider(ax_s_emg, "", emg_min, emg_max, valinit=float(self.emg_rms_threshold))
         ax_s_emg.set_title("EMG thr", fontsize=9)
-        self._slider_wheel = Slider(ax_s_wheel, "", 0.0, wheel_max, valinit=float(self.wheel_speed_threshold))
-        ax_s_wheel.set_title("Wheel thr", fontsize=9)
+        self._slider_low_freq = Slider(
+            ax_s_low_freq,
+            "",
+            low_freq_min,
+            low_freq_max,
+            valinit=float(self.low_freq_threshold),
+        )
+        ax_s_low_freq.set_title("Low-freq thr", fontsize=9)
         self._slider_ratio = Slider(ax_s_ratio, "", ratio_min, ratio_max, valinit=float(self.theta_delta_ratio_threshold))
-        ax_s_ratio.set_title("θ/δ thr", fontsize=9)
+        ax_s_ratio.set_title("θ ratio thr", fontsize=9)
 
         self._slider_emg.on_changed(on_emg_slider)
-        self._slider_wheel.on_changed(on_wheel_slider)
+        self._slider_low_freq.on_changed(on_low_freq_slider)
         self._slider_ratio.on_changed(on_ratio_slider)
 
     # -----------------------------
@@ -2408,17 +2452,12 @@ class VideoAnalysisApp(QMainWindow):
 
         # masking (existing behaviour)
         epoch_moving = self._compute_epoch_motion_mask()
-        theta_masked = self.theta_power.copy()
-        delta_masked = self.delta_power.copy()
-        theta_masked[epoch_moving] = np.nan
-        delta_masked[epoch_moving] = np.nan
-
-        ratio_masked = theta_masked / delta_masked
-        ratio_masked[~np.isfinite(ratio_masked)] = np.nan
-
-        delta_thr_value = None
-        if self.delta_power_threshold is not None and np.isfinite(self.delta_power_threshold):
-            delta_thr_value = float(self.delta_power_threshold)
+        ratio_masked = np.asarray(self.theta_delta_ratio_smoothed, dtype=float)
+        if ratio_masked.size > 0:
+            ratio_masked = ratio_masked.copy()
+            ratio_masked[epoch_moving] = np.nan
+        else:
+            ratio_masked = np.full_like(self.epoch_t, np.nan, dtype=float)
 
         # Full rebuild
         self.figure.clear()
@@ -2436,7 +2475,7 @@ class VideoAnalysisApp(QMainWindow):
         # 1) EMG RMS
         ax1 = axs[0]
         ax1.plot(self.emg_rms_10hz_t, self.emg_rms_10hz, color=emg_color, label="EMG RMS")
-        ax1.set_ylabel("EMG RMS", color=emg_color)
+        ax1.set_ylabel("EMG\nRMS", color=emg_color)
         ax1.spines['top'].set_visible(False)
         ax1.spines['right'].set_visible(False)
         ax1.tick_params(axis='y', labelcolor=emg_color)
@@ -2540,22 +2579,28 @@ class VideoAnalysisApp(QMainWindow):
         ax4.spines['right'].set_visible(False)
         ax4.tick_params(axis='x', labelbottom=False)
 
-        # 5) Theta + Delta (raw power)
+        # 5) Low-frequency power
         ax5 = axs[4]
-        ax5.plot(self.epoch_t, theta_masked, label="Theta")
-        ax5.plot(self.epoch_t, delta_masked, label="Delta")
-        ax5.set_ylabel("Power")
+        low_freq_source = (
+            self.low_freq_power_smoothed
+            if isinstance(self.low_freq_power_smoothed, np.ndarray) and self.low_freq_power_smoothed.size > 0
+            else self.low_freq_power
+        )
+        low_freq_vals = np.asarray(low_freq_source, dtype=float)
+        if low_freq_vals.size > 0:
+            lf_masked = low_freq_vals.copy()
+            lf_masked[epoch_moving] = np.nan
+        else:
+            lf_masked = np.full_like(self.epoch_t, np.nan, dtype=float)
+        ax5.plot(self.epoch_t, lf_masked, color='tab:orange', label="Low-freq power")
+        ax5.set_ylabel("Low freq\npower")
         ax5.spines['top'].set_visible(False)
         ax5.spines['right'].set_visible(False)
         ax5.tick_params(axis='x', labelbottom=False)
-        ax5.legend(loc="upper right")
-        if delta_thr_value is not None:
-            ax5.axhline(delta_thr_value, color='r', linestyle='--', linewidth=1)
-
         # 6) Ratio plot
         ax6 = axs[5]
-        ax6.plot(self.epoch_t, ratio_masked)
-        ax6.set_ylabel("Δ/Θ")
+        ax6.plot(self.epoch_t, ratio_masked, color='tab:green')
+        ax6.set_ylabel("θ/δ")
         ax6.spines['top'].set_visible(False)
         ax6.spines['right'].set_visible(False)
         ax6.tick_params(axis='x', labelbottom=False)
@@ -2568,7 +2613,7 @@ class VideoAnalysisApp(QMainWindow):
         ax7.spines['right'].set_visible(False)
 
         self._ax_emg = ax1
-        self._ax_wheel = ax2
+        self._ax_low_freq = ax5
         self._ax_ratio = ax6
         self._ax_state = ax7
 

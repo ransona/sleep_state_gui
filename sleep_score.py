@@ -46,10 +46,12 @@ RMS_WINDOW_SEC = 1.0              # 1 s RMS window
 SPEC_WINDOW_SEC = 5.0             # 5 s window
 SPEC_STRIDE_SEC = 2.0             # 2 s stride
 
+# Watson log-spaced spectrogram
+LOG_SPEC_WINDOW_SEC = 10.0
+LOG_SPEC_STEP_SEC = 1.0
+LOG_SPEC_FREQ_BINS = np.logspace(np.log10(1.0), np.log10(100.0), num=60)
+
 # thresholds / smoothing parameters
-WHEEL_SPEED_THRESHOLD = 1.0       # abs(wheel) > this -> movement
-EMG_SD_MULT = 3.0                 # EMG thr = mean + EMG_SD_MULT * sd (low component)
-THETA_RATIO_SD_MULT = 2.0         # theta/delta thr = mean + THETA_RATIO_SD_MULT * sd
 SAVGOL_BASE_WIN = 11              # base window for Savitzky–Golay (adaptive)
 
 # state code mapping
@@ -65,7 +67,7 @@ STATE_LABELS = {
     STATE_REM: "rem",
 }
 
-DEFAULT_DELTA_BAND = (1.0, 5.0)
+DEFAULT_DELTA_BAND = (1.0, 4.0)
 DEFAULT_THETA_BAND = (5.0, 10.0)
 
 
@@ -185,6 +187,114 @@ def _adaptive_savgol(x, base_window, poly=3):
         return x.copy()
 
     return signal.savgol_filter(x, window_length=win, polyorder=poly, mode="nearest")
+
+
+def _epoch_edges_from_centers(epoch_centers):
+    et = np.asarray(epoch_centers, dtype=float)
+    if et.size == 0:
+        return np.array([], dtype=float)
+    if et.size == 1:
+        return np.array([et[0] - 5.0, et[0] + 5.0], dtype=float)
+    mids = (et[:-1] + et[1:]) / 2.0
+    first_edge = et[0] - (mids[0] - et[0])
+    last_edge = et[-1] + (et[-1] - mids[-1])
+    return np.concatenate(([first_edge], mids, [last_edge]))
+
+
+def _epoch_mean_from_timeseries(t, x, epoch_centers):
+    t = np.asarray(t, dtype=float)
+    x = np.asarray(x, dtype=float)
+    et = np.asarray(epoch_centers, dtype=float)
+    edges = _epoch_edges_from_centers(et)
+    means = np.full(et.shape, np.nan, dtype=float)
+    for idx in range(et.size):
+        start = edges[idx]
+        stop = edges[idx + 1]
+        mask = (t >= start) & (t < stop) & np.isfinite(x)
+        if np.any(mask):
+            means[idx] = float(np.mean(x[mask]))
+    return means
+
+
+def _resample_spectrogram(freqs, sxx, target_freqs):
+    freq_arr = np.asarray(freqs, dtype=float)
+    target = np.asarray(target_freqs, dtype=float)
+    if target.size == 0:
+        return np.empty((0, sxx.shape[1]), dtype=float)
+    mask = (freq_arr >= target[0]) & (freq_arr <= target[-1])
+    if not np.any(mask):
+        raise ValueError("spectrogram does not cover target frequency range")
+    freq_sel = freq_arr[mask]
+    spec_sel = np.asarray(sxx[mask], dtype=float)
+    interp = interp1d(
+        freq_sel,
+        spec_sel,
+        axis=0,
+        bounds_error=False,
+        fill_value="extrapolate",
+    )
+    resampled = interp(target)
+    resampled[resampled < 0] = 0.0
+    return resampled
+
+
+def _first_principal_component(matrix):
+    mat = np.asarray(matrix, dtype=float)
+    if mat.ndim != 2:
+        raise ValueError("matrix must be 2D")
+    if mat.size == 0:
+        return np.zeros(0, dtype=float), np.zeros(mat.shape[0], dtype=float)
+    X = mat.T
+    if X.size == 0:
+        return np.zeros(X.shape[0], dtype=float), np.zeros(mat.shape[0], dtype=float)
+    u, s, vt = np.linalg.svd(X, full_matrices=False)
+    if s.size == 0:
+        scores = np.zeros(X.shape[0], dtype=float)
+        loadings = np.zeros(mat.shape[0], dtype=float)
+    else:
+        scores = u[:, 0] * s[0]
+        loadings = vt[0]
+    return scores, loadings
+
+
+def _band_power_ratio(spectrogram, freqs, low_band, high_band):
+    freqs_arr = np.asarray(freqs, dtype=float)
+    low_mask = (freqs_arr >= low_band[0]) & (freqs_arr <= low_band[1])
+    high_mask = (freqs_arr >= high_band[0]) & (freqs_arr <= high_band[1])
+    low_power = np.sum(spectrogram[low_mask], axis=0) if np.any(low_mask) else np.zeros(
+        spectrogram.shape[1], dtype=float
+    )
+    high_power = np.sum(spectrogram[high_mask], axis=0) if np.any(high_mask) else np.zeros(
+        spectrogram.shape[1], dtype=float
+    )
+    ratio = np.zeros_like(low_power, dtype=float)
+    valid = high_power > 0
+    ratio[valid] = low_power[valid] / high_power[valid]
+    ratio[~np.isfinite(ratio)] = np.nan
+    return ratio
+
+
+def _trough_of_bimodal_distribution(values):
+    arr = np.asarray(values, dtype=float)
+    finite = arr[np.isfinite(arr)]
+    if finite.size == 0:
+        return float(np.nan)
+    bin_count = max(10, min(80, int(np.sqrt(finite.size) * 2)))
+    counts, edges = np.histogram(finite, bins=bin_count)
+    if counts.size == 0:
+        return float(np.nan)
+    peaks, _ = signal.find_peaks(counts)
+    if peaks.size < 2:
+        return float(np.nanmedian(finite))
+    peak_heights = counts[peaks]
+    top_idxs = np.argsort(peak_heights)[-2:]
+    left_peak, right_peak = np.sort(peaks[top_idxs])
+    trough_segment = counts[left_peak : right_peak + 1]
+    if trough_segment.size == 0:
+        return float(np.nanmedian(finite))
+    trough_idx = left_peak + int(np.nanargmin(trough_segment))
+    midpoint = 0.5 * (edges[trough_idx] + edges[trough_idx + 1])
+    return float(midpoint)
 
 
 def downsample_to_target_fs(x, fs_original, fs_target, t=None):
@@ -348,6 +458,10 @@ def build_epoch_feature_dict(
     theta_delta_ratio=None,
     theta_delta_ratio_smoothed=None,
     delta_power_smoothed=None,
+    low_freq_power=None,
+    low_freq_power_smoothed=None,
+    theta_ratio=None,
+    theta_ratio_smoothed=None,
 ):
     """
     Bundle epoch-level summary data required for reclassification.
@@ -382,53 +496,64 @@ def build_epoch_feature_dict(
     else:
         delta_power_smoothed = _as_float_array(delta_power_smoothed).astype(np.float32)
 
+    if theta_ratio is None:
+        theta_ratio_vals = ratio.astype(np.float32)
+    else:
+        theta_ratio_vals = _as_float_array(theta_ratio).astype(np.float32)
+
+    if theta_ratio_smoothed is None:
+        theta_ratio_smooth = _adaptive_savgol(theta_ratio_vals, SAVGOL_BASE_WIN).astype(np.float32)
+    else:
+        theta_ratio_smooth = _as_float_array(theta_ratio_smoothed).astype(np.float32)
+
+    if low_freq_power is None:
+        low_freq_mean = np.full(theta_power_epochs.shape, np.nan, dtype=np.float32)
+    else:
+        low_freq_mean = _as_float_array(low_freq_power).astype(np.float32)
+
+    if low_freq_power_smoothed is None:
+        low_freq_smooth = _adaptive_savgol(low_freq_mean, SAVGOL_BASE_WIN).astype(np.float32)
+    else:
+        low_freq_smooth = _as_float_array(low_freq_power_smoothed).astype(np.float32)
+
     return {
         "epoch_time": epoch_time,
         "theta_power": theta_power_epochs,
         "delta_power": delta_power_epochs,
         "theta_delta_ratio": ratio.astype(np.float32),
         "theta_delta_ratio_smoothed": ratio_smoothed,
+        "theta_ratio": theta_ratio_vals,
+        "theta_ratio_smoothed": theta_ratio_smooth,
         "delta_power_smoothed": delta_power_smoothed,
         "emg_rms_mean": emg_rms_mean_by_epoch,
         "wheel_speed_mean": wheel_speed_mean_by_epoch,
+        "low_freq_power": low_freq_mean,
+        "low_freq_power_smoothed": low_freq_smooth,
     }
 
 
 def estimate_thresholds_from_epoch_features(epoch_features: Dict) -> Dict[str, float]:
     """
-    Estimate thresholds using the current automated heuristics.
+    Estimate thresholds using trough detection on the available epoch metrics.
     """
-    emg_vals = _as_float_array(epoch_features["emg_rms_mean"])
-    delta_power_smoothed = _as_float_array(epoch_features["delta_power_smoothed"])
 
-    n_epochs = emg_vals.size
-    if n_epochs < 2:
-        emg_threshold = float(
-            np.nanmean(emg_vals) + EMG_SD_MULT * np.nanstd(emg_vals)
-        )
-    else:
-        emg_rms_reshaped = emg_vals.reshape(-1, 1)
-        gmm = GaussianMixture(n_components=2)
-        gmm.fit(emg_rms_reshaped)
-        emg_component_idx = gmm.predict(emg_rms_reshaped)
-        comp_means = [
-            np.nanmean(emg_vals[emg_component_idx == i]) for i in range(2)
-        ]
-        low_emg_comp = int(np.nanargmin(comp_means))
-        low_emg_values = emg_vals[emg_component_idx == low_emg_comp]
-        emg_threshold = float(
-            np.nanmean(low_emg_values) + EMG_SD_MULT * np.nanstd(low_emg_values)
-        )
+    def _resolve(arr):
+        arr_vals = _as_float_array(arr)
+        thr = _trough_of_bimodal_distribution(arr_vals)
+        if np.isfinite(thr):
+            return thr
+        if arr_vals.size == 0:
+            return float(np.nan)
+        return float(np.nanmedian(arr_vals))
 
-    # Maintain current behaviour: theta/delta threshold hard-coded
-    theta_ratio_thr = 2.0
-    delta_power_thr = float(np.nanmean(delta_power_smoothed))
+    low_freq = epoch_features.get("low_freq_power_smoothed", epoch_features.get("low_freq_power", []))
+    theta_ratio = epoch_features.get("theta_delta_ratio_smoothed", epoch_features.get("theta_ratio_smoothed", []))
+    emg_vals = epoch_features.get("emg_rms_mean", [])
 
     return {
-        "emg_rms_threshold": emg_threshold,
-        "wheel_speed_threshold": float(WHEEL_SPEED_THRESHOLD),
-        "theta_delta_ratio_threshold": theta_ratio_thr,
-        "delta_power_threshold": delta_power_thr,
+        "low_freq_threshold": _resolve(low_freq),
+        "theta_ratio_threshold": _resolve(theta_ratio),
+        "emg_rms_threshold": _resolve(emg_vals),
     }
 
 
@@ -456,6 +581,26 @@ def score_from_epoch_features(
     resolved_thresholds : dict
         Threshold values actually used.
     """
+    def _normalize_thresholds(thr_dict):
+        if not thr_dict:
+            return {}
+        mapping = {
+            "low_freq_threshold": "low_freq_threshold",
+            "delta_power_threshold": "low_freq_threshold",
+            "wheel_speed_threshold": "low_freq_threshold",
+            "theta_ratio_threshold": "theta_ratio_threshold",
+            "theta_delta_ratio_threshold": "theta_ratio_threshold",
+            "emg_rms_threshold": "emg_rms_threshold",
+        }
+        normalized = {}
+        for key, value in thr_dict.items():
+            if value is None:
+                continue
+            mapped = mapping.get(key, key)
+            normalized[mapped] = float(value)
+        return normalized
+
+    normalized_thresholds = _normalize_thresholds(thresholds)
     auto_vals = estimate_thresholds_from_epoch_features(epoch_features)
 
     if auto_thresholds or thresholds is None:
@@ -463,34 +608,51 @@ def score_from_epoch_features(
     else:
         resolved = {}
         for key, auto_val in auto_vals.items():
-            if thresholds is not None and key in thresholds and thresholds[key] is not None:
-                resolved[key] = float(thresholds[key])
+            if key in normalized_thresholds:
+                resolved[key] = normalized_thresholds[key]
             else:
                 resolved[key] = auto_val
 
     emg = _as_float_array(epoch_features["emg_rms_mean"])
-    wheel = _as_float_array(epoch_features["wheel_speed_mean"])
     ratio = _as_float_array(epoch_features["theta_delta_ratio_smoothed"])
-    delta_sm = _as_float_array(epoch_features["delta_power_smoothed"])
 
     n = emg.size
-    if wheel.size != n or ratio.size != n or delta_sm.size != n:
+    low_freq = _as_float_array(epoch_features["low_freq_power_smoothed"])
+    if ratio.size != n or low_freq.size != n:
         raise ValueError("epoch feature arrays must have matching lengths")
 
-    emg_thr = resolved["emg_rms_threshold"]
-    wheel_thr = resolved["wheel_speed_threshold"]
-    ratio_thr = resolved["theta_delta_ratio_threshold"]
-    delta_thr = resolved["delta_power_threshold"]
+    emg_thr = resolved.get("emg_rms_threshold", float(np.nan))
+    ratio_thr = resolved.get("theta_ratio_threshold", float(np.nan))
+    low_freq_thr = resolved.get("low_freq_threshold", float(np.nan))
 
     out = np.empty(n, dtype=np.int8)
     for i in range(n):
-        moving = (emg[i] >= emg_thr) or (abs(wheel[i]) > wheel_thr)
-        if moving:
-            out[i] = STATE_ACTIVE_WAKE
-        elif ratio[i] > ratio_thr and emg[i] < emg_thr:
-            out[i] = STATE_REM
-        elif delta_sm[i] >= delta_thr and emg[i] < emg_thr:
+        low_freq_high = (
+            np.isfinite(low_freq[i])
+            and np.isfinite(low_freq_thr)
+            and low_freq[i] >= low_freq_thr
+        )
+        ratio_high = (
+            np.isfinite(ratio[i])
+            and np.isfinite(ratio_thr)
+            and ratio[i] >= ratio_thr
+        )
+        emg_low = (
+            np.isfinite(emg[i])
+            and np.isfinite(emg_thr)
+            and emg[i] < emg_thr
+        )
+        emg_high = (
+            np.isfinite(emg[i])
+            and np.isfinite(emg_thr)
+            and emg[i] >= emg_thr
+        )
+        if low_freq_high:
             out[i] = STATE_NREM
+        elif ratio_high and emg_low:
+            out[i] = STATE_REM
+        elif emg_high:
+            out[i] = STATE_ACTIVE_WAKE
         else:
             out[i] = STATE_QUIET_WAKE
 
@@ -629,7 +791,7 @@ def run_sleep_scoring(
         - delta/theta band metadata
     """
     start_time = time.time()
-    total_steps = 13
+    total_steps = 14
     step_idx = 0
     _report_progress(progress_callback, step_idx, total_steps, "Starting sleep scoring")
     print(f"starting sleep scoring for user_id={user_id}, exp_id={exp_id}")
@@ -691,18 +853,60 @@ def run_sleep_scoring(
     # -------------------------------------------------------------
     step_idx += 1
     _report_progress(progress_callback, step_idx, total_steps, "Computing EMG RMS (1 s window)")
-    print("[3/9] computing emg rms (1 s window)")
+    print("[3/14] computing emg rms (1 s window)")
     rms_window = int(RMS_WINDOW_SEC * fs)
     emg_rms = moving_rms(emg_filtered, rms_window)
     emg_rms_full = emg_rms.copy()  # save full-length RMS for plotting
 
     # -------------------------------------------------------------
-    # 4. eeg band-pass into delta and theta
+    # 4. log-spaced spectrogram (10 s window, 1 s stride)
+    # -------------------------------------------------------------
+    step_idx += 1
+    _report_progress(progress_callback, step_idx, total_steps, "Computing log-frequency spectrogram")
+    print("[4/14] computing log-frequency spectrogram (10 s window, 1 s stride)")
+    log_nperseg = int(LOG_SPEC_WINDOW_SEC * fs)
+    log_step = int(LOG_SPEC_STEP_SEC * fs)
+    if log_step <= 0:
+        raise ValueError("log spectrogram step must be positive")
+    log_noverlap = log_nperseg - log_step
+    if log_noverlap >= log_nperseg:
+        raise ValueError("log-frequency spectrogram noverlap must be < nperseg")
+
+    log_freqs, log_rel_t, log_sxx = signal.spectrogram(
+        eeg_filtered,
+        fs=fs,
+        window="hann",
+        nperseg=log_nperseg,
+        noverlap=log_noverlap,
+        scaling="density",
+        mode="psd",
+    )
+    log_t_abs = t_ephys[0] + log_rel_t
+    log_sxx_resampled = _resample_spectrogram(log_freqs, log_sxx, LOG_SPEC_FREQ_BINS)
+    log_sxx_db = np.log10(log_sxx_resampled + 1e-12)
+    freq_mean = np.nanmean(log_sxx_db, axis=1, keepdims=True)
+    freq_std = np.nanstd(log_sxx_db, axis=1, keepdims=True)
+    freq_std[~np.isfinite(freq_std) | (freq_std <= 0)] = 1.0
+    log_sxx_z = (log_sxx_db - freq_mean) / freq_std
+    low_freq_series, low_freq_weights = _first_principal_component(log_sxx_z)
+    low_freq_mask = LOG_SPEC_FREQ_BINS <= 20.0
+    if np.any(low_freq_mask) and np.isfinite(np.nansum(low_freq_weights[low_freq_mask])):
+        if np.nansum(low_freq_weights[low_freq_mask]) < 0:
+            low_freq_series = -low_freq_series
+    theta_ratio_series = _band_power_ratio(
+        log_sxx_resampled,
+        LOG_SPEC_FREQ_BINS,
+        theta_band,
+        delta_band,
+    )
+
+    # -------------------------------------------------------------
+    # 5. eeg band-pass into delta and theta
     # -------------------------------------------------------------
     step_idx += 1
     _report_progress(progress_callback, step_idx, total_steps, "Filtering EEG into delta/theta bands")
     print(
-        f"[4/9] band-pass filtering eeg into delta ({delta_band[0]:.2f}-{delta_band[1]:.2f} Hz) "
+        f"[5/14] band-pass filtering eeg into delta ({delta_band[0]:.2f}-{delta_band[1]:.2f} Hz) "
         f"and theta ({theta_band[0]:.2f}-{theta_band[1]:.2f} Hz)"
     )
     delta_b = butter(2, delta_band, btype="bandpass", fs=fs)
@@ -715,7 +919,7 @@ def run_sleep_scoring(
     # -------------------------------------------------------------
     step_idx += 1
     _report_progress(progress_callback, step_idx, total_steps, "Computing EEG spectrogram")
-    print("[5/9] computing eeg spectrogram (5 s window, 2 s stride)")
+    print("[6/14] computing eeg spectrogram (5 s window, 2 s stride)")
     spec_nperseg = int(SPEC_WINDOW_SEC * fs)
     spec_step = int(SPEC_STRIDE_SEC * fs)
     spec_noverlap = spec_nperseg - spec_step
@@ -740,11 +944,11 @@ def run_sleep_scoring(
     wheel_step_msg = "Using simulated wheel speed (zeros)" if simulated else "Resampling wheel speed"
     _report_progress(progress_callback, step_idx, total_steps, wheel_step_msg)
     if simulated:
-        print("[6/9] using simulated wheel speed (zeros)")
+        print("[7/14] using simulated wheel speed (zeros)")
         wheel_speed_full = np.zeros_like(t_ephys, dtype=float)
         wheel_speed_resampled = wheel_speed_full.copy()
     else:
-        print("[6/9] resampling wheel speed to ephys time base")
+        print("[7/14] resampling wheel speed to ephys time base")
         wheel_speed_raw = wheel_df["speed"]
         wheel_t = wheel_df["t"]
         wheel_speed_resampled = np.interp(t_ephys, wheel_t, wheel_speed_raw)
@@ -755,7 +959,7 @@ def run_sleep_scoring(
     # -------------------------------------------------------------
     step_idx += 1
     _report_progress(progress_callback, step_idx, total_steps, "Epoching signals (10 s)")
-    print("[7/9] epoching signals (10 s epochs)")
+    print("[8/14] epoching signals (10 s epochs)")
 
     n_samples = len(eeg_theta)
     n_epochs = n_samples // EPOCH_LEN_SAMPLES
@@ -780,7 +984,7 @@ def run_sleep_scoring(
 
     step_idx += 1
     _report_progress(progress_callback, step_idx, total_steps, "Computing epoch-level power features")
-    print("[8/9] computing epoch-wise power features")
+    print("[9/14] computing epoch-wise power features")
     theta_power_epochs = epoch_total_power(eeg_theta_epochs, fs)
     delta_power_epochs = epoch_total_power(eeg_delta_epochs, fs)
 
@@ -788,12 +992,15 @@ def run_sleep_scoring(
     theta_delta_ratio = theta_power_epochs / delta_power_epochs
     theta_delta_ratio_smoothed = _adaptive_savgol(theta_delta_ratio, SAVGOL_BASE_WIN)
 
+    low_freq_by_epoch = _epoch_mean_from_timeseries(log_t_abs, low_freq_series, epoch_time)
+    theta_ratio_by_epoch = _epoch_mean_from_timeseries(log_t_abs, theta_ratio_series, epoch_time)
+
     # -------------------------------------------------------------
     # 8. thresholds and state classification
     # -------------------------------------------------------------
     step_idx += 1
     _report_progress(progress_callback, step_idx, total_steps, "Classifying sleep states")
-    print("[9/9] estimating thresholds and classifying states")
+    print("[10/14] estimating thresholds and classifying states")
     emg_rms_mean_by_epoch = emg_rms_epochs.mean(axis=1)
     wheel_speed_mean_by_epoch = wheel_speed_epochs.mean(axis=1)
 
@@ -806,6 +1013,8 @@ def run_sleep_scoring(
         theta_delta_ratio=theta_delta_ratio,
         theta_delta_ratio_smoothed=theta_delta_ratio_smoothed,
         delta_power_smoothed=delta_power_smoothed,
+        low_freq_power=low_freq_by_epoch,
+        theta_ratio=theta_ratio_by_epoch,
     )
 
     sleep_state_epoch, thresholds_used = score_from_epoch_features(
@@ -814,14 +1023,12 @@ def run_sleep_scoring(
     )
 
     emg_threshold = thresholds_used["emg_rms_threshold"]
-    wheel_speed_thr = thresholds_used["wheel_speed_threshold"]
-    theta_ratio_thr = thresholds_used["theta_delta_ratio_threshold"]
-    delta_power_thr = thresholds_used["delta_power_threshold"]
+    theta_ratio_thr = thresholds_used["theta_ratio_threshold"]
+    low_freq_thr = thresholds_used["low_freq_threshold"]
 
     print(f"  - emg_threshold: {emg_threshold:.4f}")
     print(f"  - theta_ratio_thr: {theta_ratio_thr:.4f}")
-    print(f"  - delta_power_thr: {delta_power_thr:.4f}")
-    print(f"  - wheel_speed_thr: {wheel_speed_thr:.4f}")
+    print(f"  - low_freq_thr: {low_freq_thr:.4f}")
 
     # -------------------------------------------------------------
     # 9. downsample to 10 Hz and interpolate states
@@ -917,9 +1124,11 @@ def run_sleep_scoring(
 
         # thresholds used for classification
         "emg_rms_threshold": float(emg_threshold),
-        "wheel_speed_threshold": float(wheel_speed_thr),
+        "theta_ratio_threshold": float(theta_ratio_thr),
         "theta_delta_ratio_threshold": float(theta_ratio_thr),
-        "delta_power_threshold": float(delta_power_thr),
+        "low_freq_threshold": float(low_freq_thr),
+        "delta_power_threshold": float(low_freq_thr),
+        "wheel_speed_threshold": float(np.nan),
 
         # cached epoch features for downstream rescoring
         "epoch_features": {
