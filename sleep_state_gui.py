@@ -463,6 +463,7 @@ class VideoAnalysisApp(QMainWindow):
         self.low_freq_threshold = None
         self.theta_delta_ratio_threshold = None
         self.delta_power_threshold = None
+        self.locomotion_threshold = 0.1
 
         # eye frame times
         self.eye_frame_times = None
@@ -495,17 +496,22 @@ class VideoAnalysisApp(QMainWindow):
 
         self._axs = None
         self._ax_emg = None
+        self._ax_wheel = None
         self._ax_low_freq = None
         self._ax_ratio = None
         self._ax_state = None
 
         self._thr_drag_emg = None
+        self._thr_drag_wheel = None
         self._thr_drag_low_freq = None
         self._thr_drag_ratio = None
+        self._thr_drag_wheel = None
 
         self._slider_emg = None
+        self._slider_wheel = None
         self._slider_low_freq = None
         self._slider_ratio = None
+        self._slider_wheel = None
 
         self._syncing_slider = False
 
@@ -524,80 +530,89 @@ class VideoAnalysisApp(QMainWindow):
         self.setWindowTitle("Sleep State GUI")
         centralWidget = QWidget()
         self.setCentralWidget(centralWidget)
-        mainLayout = QVBoxLayout(centralWidget)
+        mainLayout = QHBoxLayout(centralWidget)
 
-        # --- Top input fields ---
-        inputLayout = QHBoxLayout()
+        controlsContainer = QWidget()
+        controlsLayout = QVBoxLayout(controlsContainer)
+        controlsLayout.setSpacing(8)
+
+        plotsContainer = QWidget()
+        plotsLayout = QVBoxLayout(plotsContainer)
+        plotsLayout.setContentsMargins(0, 0, 0, 0)
+
+        mainLayout.addWidget(controlsContainer, 1)
+        mainLayout.addWidget(plotsContainer, 4)
+
+        # --- Top input fields (two rows to save width) ---
+        inputRow1 = QHBoxLayout()
         self.userIdEdit = QLineEdit()
         self.userIdEdit.setPlaceholderText("Enter User ID")
         self.userIdEdit.setText(DEFAULT_USER_ID)
+        inputRow1.addWidget(QLabel("User ID:"))
+        inputRow1.addWidget(self.userIdEdit)
+
         self.expIdEdit = QLineEdit()
         self.expIdEdit.setPlaceholderText("Enter Experiment ID")
         self.expIdEdit.setText(DEFAULT_EXP_ID)
+        inputRow1.addWidget(QLabel("Exp ID:"))
+        inputRow1.addWidget(self.expIdEdit)
+        controlsLayout.addLayout(inputRow1)
 
+        inputRow2 = QHBoxLayout()
         self.loadButton = QPushButton("Load Data")
         self.loadButton.clicked.connect(self.loadData)
-
         self.scoreButton = QPushButton("Run Sleep Scoring")
         self.scoreButton.clicked.connect(self.runSleepScoringClicked)
-
         self.simulationCheck = QCheckBox("Simulated EEG/EMG")
         self.simulationCheck.toggled.connect(self.onSimModeToggled)
         self.simulationLabel = QLabel("")
         self.simulationLabel.setFixedWidth(140)
         self.simulationLabel.setStyleSheet("color: gray;")
+        inputRow2.addWidget(self.loadButton)
+        inputRow2.addWidget(self.scoreButton)
+        inputRow2.addWidget(self.simulationCheck)
+        inputRow2.addWidget(self.simulationLabel)
+        controlsLayout.addLayout(inputRow2)
 
-        inputLayout.addWidget(QLabel("User ID:"))
-        inputLayout.addWidget(self.userIdEdit)
-        inputLayout.addWidget(QLabel("Experiment ID:"))
-        inputLayout.addWidget(self.expIdEdit)
-        inputLayout.addWidget(self.loadButton)
-        inputLayout.addWidget(self.scoreButton)
-        inputLayout.addWidget(self.simulationCheck)
-        inputLayout.addWidget(self.simulationLabel)
-        mainLayout.addLayout(inputLayout)
-
-        # --- Video controls ---
-        controlLayout = QHBoxLayout()
+        # --- Playback controls ---
+        sliderRow = QHBoxLayout()
         self.slider = QSlider(Qt.Horizontal)
         self.slider.setEnabled(False)
         self.slider.valueChanged.connect(self.updateFrame)
+        sliderRow.addWidget(self.slider)
+        controlsLayout.addLayout(sliderRow)
 
+        playbackRow = QHBoxLayout()
         self.playButton = QPushButton("Play")
         self.playButton.setEnabled(False)
         self.playButton.clicked.connect(self.startPlayback)
-
         self.stopButton = QPushButton("Stop")
         self.stopButton.setEnabled(False)
         self.stopButton.clicked.connect(self.stopPlayback)
-
         self.frameJumpEdit = QLineEdit()
         self.frameJumpEdit.setPlaceholderText("Time (s)")
-        self.frameJumpEdit.setFixedWidth(100)
+        self.frameJumpEdit.setFixedWidth(90)
         self.frameJumpEdit.setEnabled(False)
         self.frameJumpEdit.returnPressed.connect(self.jumpToTypedFrame)
-
         self.centerViewBtn = QPushButton("Jump to View Center")
         self.centerViewBtn.setEnabled(False)
-        self.centerViewBtn.clicked.connect(self.jumpToViewCenter)
+        self.centerViewBtn.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        playbackRow.addWidget(self.playButton)
+        playbackRow.addWidget(self.stopButton)
+        playbackRow.addWidget(QLabel("Current / Go to:"))
+        playbackRow.addWidget(self.frameJumpEdit)
+        playbackRow.addWidget(self.centerViewBtn)
+        controlsLayout.addLayout(playbackRow)
 
-        controlLayout.addWidget(self.slider)
-        controlLayout.addWidget(self.playButton)
-        controlLayout.addWidget(self.stopButton)
-        controlLayout.addWidget(QLabel("Current / Go to:"))
-        controlLayout.addWidget(self.frameJumpEdit)
-        controlLayout.addWidget(self.centerViewBtn)
-        mainLayout.addLayout(controlLayout)
-
-        # --- Video display ---
+        # --- Video display (two videos on one row) ---
         videoLayout = QHBoxLayout()
         self.leftVideoLabel = QLabel("Left Eye Video")
-        self.leftVideoLabel.setFixedSize(320, 120)
+        self.leftVideoLabel.setFixedSize(240, 120)
         self.rightVideoLabel = QLabel("Right Eye Video")
-        self.rightVideoLabel.setFixedSize(320, 120)
+        self.rightVideoLabel.setFixedSize(240, 120)
         videoLayout.addWidget(self.leftVideoLabel)
         videoLayout.addWidget(self.rightVideoLabel)
-        mainLayout.addLayout(videoLayout)
+        controlsLayout.addLayout(videoLayout)
 
         videoOptionsLayout = QHBoxLayout()
         self.showVideosCheck = QCheckBox("Show eye videos")
@@ -611,36 +626,46 @@ class VideoAnalysisApp(QMainWindow):
         self.showOverlayCheck.setEnabled(False)
         self.showOverlayCheck.toggled.connect(self.onOverlayToggled)
         videoOptionsLayout.addWidget(self.showOverlayCheck)
-        videoOptionsLayout.addSpacing(20)
-        videoOptionsLayout.addWidget(QLabel("Motion smoothing (s):"))
+        controlsLayout.addLayout(videoOptionsLayout)
+
+        smoothingRow = QHBoxLayout()
+        smoothingRow.addWidget(QLabel("Motion smoothing (s):"))
         self.motionSmoothSpin = QDoubleSpinBox()
         self.motionSmoothSpin.setRange(0.0, 5.0)
         self.motionSmoothSpin.setSingleStep(0.1)
         self.motionSmoothSpin.setValue(self.motion_smoothing_secs)
         self.motionSmoothSpin.setFixedWidth(100)
         self.motionSmoothSpin.valueChanged.connect(self.onMotionSmoothingChanged)
-        videoOptionsLayout.addWidget(self.motionSmoothSpin)
-        videoOptionsLayout.addStretch(1)
-        mainLayout.addLayout(videoOptionsLayout)
+        smoothingRow.addWidget(self.motionSmoothSpin)
+        smoothingRow.addStretch(1)
+        controlsLayout.addLayout(smoothingRow)
 
-        # --- Spectrogram saturation + locomotion SD controls + threshold edit toggle ---
-        satLayout = QHBoxLayout()
-        satLayout.addWidget(QLabel("Spectrogram saturation (% in 0–20 Hz):"))
+        # --- Spectrogram saturation + locomotion SD and threshold controls ---
+        satRow = QHBoxLayout()
+        satRow.addWidget(QLabel("Spectrogram saturation (% 0–20 Hz):"))
         self.satPercentEdit = QLineEdit("90")
         self.satPercentEdit.setFixedWidth(60)
         self.satPercentEdit.setEnabled(False)
         self.satPercentEdit.editingFinished.connect(self.plotTraces)
-        satLayout.addWidget(self.satPercentEdit)
+        satRow.addWidget(self.satPercentEdit)
+        controlsLayout.addLayout(satRow)
 
-        satLayout.addSpacing(20)
-        satLayout.addWidget(QLabel("Locomotion SD threshold (masking):"))
-        self.locSdEdit = QLineEdit("1.0")
+        locRow = QHBoxLayout()
+        locRow.addWidget(QLabel("Locomotion SD (mask):"))
+        self.locSdEdit = QLineEdit("10")
         self.locSdEdit.setFixedWidth(60)
         self.locSdEdit.setEnabled(False)
         self.locSdEdit.editingFinished.connect(self.plotTraces)
-        satLayout.addWidget(self.locSdEdit)
+        locRow.addSpacing(8)
+        locRow.addWidget(QLabel("Locomotion thr (wake):"))
+        self.locomotionThresholdEdit = QLineEdit("0.1")
+        self.locomotionThresholdEdit.setFixedWidth(70)
+        self.locomotionThresholdEdit.setEnabled(False)
+        self.locomotionThresholdEdit.editingFinished.connect(self._on_locomotion_threshold_changed)
+        locRow.addWidget(self.locomotionThresholdEdit)
+        controlsLayout.addLayout(locRow)
 
-        satLayout.addSpacing(20)
+        modeRow1 = QHBoxLayout()
         self.modeThresholdButton = QRadioButton("Threshold mode")
         self.modeSelectionButton = QRadioButton("Selection mode")
         self.modeGroup = QButtonGroup(self)
@@ -650,32 +675,31 @@ class VideoAnalysisApp(QMainWindow):
         self.modeThresholdButton.setEnabled(False)
         self.modeSelectionButton.setEnabled(False)
         self.modeGroup.buttonToggled.connect(self.onModeToggled)
-        satLayout.addWidget(self.modeThresholdButton)
-        satLayout.addWidget(self.modeSelectionButton)
+        modeRow1.addWidget(self.modeThresholdButton)
+        modeRow1.addWidget(self.modeSelectionButton)
+        controlsLayout.addLayout(modeRow1)
 
-        satLayout.addSpacing(12)
+        modeRow2 = QHBoxLayout()
         self.autoRescoreCheck = QCheckBox("Auto rescore")
         self.autoRescoreCheck.setEnabled(False)
         self.autoRescoreCheck.setChecked(False)
-        satLayout.addWidget(self.autoRescoreCheck)
+        modeRow2.addWidget(self.autoRescoreCheck)
 
         self.rescoreButton = QPushButton("Rescore")
         self.rescoreButton.setEnabled(False)
         self.rescoreButton.clicked.connect(self.onRescoreClicked)
-        satLayout.addWidget(self.rescoreButton)
+        modeRow2.addWidget(self.rescoreButton)
 
         self.histogramButton = QPushButton("Show distributions")
         self.histogramButton.setEnabled(False)
         self.histogramButton.clicked.connect(self.show_threshold_histogram_dialog)
-        satLayout.addWidget(self.histogramButton)
+        modeRow2.addWidget(self.histogramButton)
 
         self.saveButton = QPushButton("Save scoring")
         self.saveButton.setEnabled(False)
         self.saveButton.clicked.connect(self.saveSleepScoring)
-        satLayout.addWidget(self.saveButton)
-
-        satLayout.addStretch(1)
-        mainLayout.addLayout(satLayout)
+        modeRow2.addWidget(self.saveButton)
+        controlsLayout.addLayout(modeRow2)
 
         # --- Delta/Theta band controls ---
         bandLayout = QHBoxLayout()
@@ -701,28 +725,28 @@ class VideoAnalysisApp(QMainWindow):
         bandLayout.addWidget(self.thetaBandLowEdit)
         bandLayout.addWidget(QLabel("to"))
         bandLayout.addWidget(self.thetaBandHighEdit)
-        bandLayout.addStretch(1)
-        mainLayout.addLayout(bandLayout)
+        controlsLayout.addLayout(bandLayout)
 
         # --- State assignment controls (buttons + shortcuts) ---
         stateAssignLayout = QHBoxLayout()
         stateAssignLayout.addWidget(QLabel("Assign state:"))
         self.stateButtonsLayout = QHBoxLayout()
         stateAssignLayout.addLayout(self.stateButtonsLayout)
-        stateAssignLayout.addStretch(1)
-        mainLayout.addLayout(stateAssignLayout)
+        controlsLayout.addLayout(stateAssignLayout)
         self.state_buttons = []
+
+        controlsLayout.addStretch(1)
 
         # --- Matplotlib canvas ---
         self.figure = Figure(figsize=(8, 8))
         self.canvas = FigureCanvas(self.figure)
         self.canvas.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.canvas.updateGeometry()
-        mainLayout.addWidget(self.canvas)
+        plotsLayout.addWidget(self.canvas)
 
         # Toolbar retained (no functionality loss)
         self.toolbar = NavigationToolbar(self.canvas, self)
-        mainLayout.addWidget(self.toolbar)
+        plotsLayout.addWidget(self.toolbar)
 
         # --- shortcuts for state assignment (0–3) ---
         self.state_shortcuts = []
@@ -1076,6 +1100,9 @@ class VideoAnalysisApp(QMainWindow):
             self.emg_rms_threshold = float(np.nanmedian(self.emg_rms_10hz))
         if not np.isfinite(self.theta_delta_ratio_threshold):
             self.theta_delta_ratio_threshold = 2.0
+        self.locomotion_threshold = float(sleep_state.get("locomotion_threshold", 0.1))
+        if not np.isfinite(self.locomotion_threshold):
+            self.locomotion_threshold = 0.1
 
         stored_features = sleep_state.get("epoch_features")
         self.epoch_features_data = None
@@ -1157,6 +1184,8 @@ class VideoAnalysisApp(QMainWindow):
 
         self.satPercentEdit.setEnabled(True)
         self.locSdEdit.setEnabled(True)
+        self.locomotionThresholdEdit.setEnabled(True)
+        self.locomotionThresholdEdit.setText(f"{self.locomotion_threshold:.3f}")
         self.modeThresholdButton.setEnabled(True)
         self.modeSelectionButton.setEnabled(True)
         self.modeSelectionButton.setChecked(True)
@@ -1839,7 +1868,7 @@ class VideoAnalysisApp(QMainWindow):
         try:
             n_sd = float(self.locSdEdit.text())
         except Exception:
-            n_sd = 1.0
+            n_sd = 10.0
         if n_sd < 0:
             n_sd = 0.0
 
@@ -1968,6 +1997,7 @@ class VideoAnalysisApp(QMainWindow):
             "theta_delta_ratio_threshold": float(self.theta_delta_ratio_threshold),
             "low_freq_threshold": float(self.low_freq_threshold),
             "delta_power_threshold": float(self.low_freq_threshold),
+            "locomotion_threshold": float(self.locomotion_threshold),
         }
         try:
             state_epoch, _ = score_from_epoch_features(
@@ -2027,6 +2057,7 @@ class VideoAnalysisApp(QMainWindow):
         sleep_state["low_freq_threshold"] = float(self.low_freq_threshold)
         sleep_state["delta_power_threshold"] = float(self.low_freq_threshold)
         sleep_state["wheel_speed_threshold"] = float(self.low_freq_threshold)
+        sleep_state["locomotion_threshold"] = float(self.locomotion_threshold)
 
         if self.epoch_features_data is not None:
             sleep_state["epoch_features"] = {
@@ -2075,6 +2106,14 @@ class VideoAnalysisApp(QMainWindow):
         self._update_save_button_state()
         if self._auto_rescore_enabled():
             self.rerun_classification()
+
+    def _on_locomotion_threshold_changed(self):
+        try:
+            new_val = float(self.locomotionThresholdEdit.text())
+        except Exception:
+            return
+        self.locomotion_threshold = new_val
+        self._handle_threshold_change()
 
     def show_threshold_histogram_dialog(self):
         if not self.loaded:
@@ -2211,6 +2250,7 @@ class VideoAnalysisApp(QMainWindow):
             self._thr_drag_emg is None
             and self._thr_drag_low_freq is None
             and self._thr_drag_ratio is None
+            and self._thr_drag_wheel is None
         ):
             return
         self._syncing_slider = True
@@ -2219,6 +2259,11 @@ class VideoAnalysisApp(QMainWindow):
                 self._thr_drag_emg.set_y(float(self.emg_rms_threshold), trigger_callback=False)
             if self._slider_emg is not None:
                 self._slider_emg.set_val(float(self.emg_rms_threshold))
+
+            if self._thr_drag_wheel is not None:
+                self._thr_drag_wheel.set_y(float(self.locomotion_threshold), trigger_callback=False)
+            if self._slider_wheel is not None:
+                self._slider_wheel.set_val(float(self.locomotion_threshold))
 
             if self._thr_drag_low_freq is not None:
                 self._thr_drag_low_freq.set_y(float(self.low_freq_threshold), trigger_callback=False)
@@ -2236,16 +2281,18 @@ class VideoAnalysisApp(QMainWindow):
         self._sync_threshold_histogram_dialog()
 
     def _disconnect_threshold_widgets(self):
-        for obj in [self._thr_drag_emg, self._thr_drag_low_freq, self._thr_drag_ratio]:
+        for obj in [self._thr_drag_emg, self._thr_drag_wheel, self._thr_drag_low_freq, self._thr_drag_ratio]:
             if obj is not None:
                 try:
                     obj.disconnect()
                 except Exception:
                     pass
         self._thr_drag_emg = None
+        self._thr_drag_wheel = None
         self._thr_drag_low_freq = None
         self._thr_drag_ratio = None
         self._slider_emg = None
+        self._slider_wheel = None
         self._slider_low_freq = None
         self._slider_ratio = None
 
@@ -2256,7 +2303,7 @@ class VideoAnalysisApp(QMainWindow):
         """
         self._disconnect_threshold_widgets()
 
-        if self._ax_emg is None or self._ax_ratio is None or self._ax_low_freq is None:
+        if self._ax_emg is None or self._ax_ratio is None or self._ax_low_freq is None or self._ax_wheel is None:
             return
 
         fig = self.figure
@@ -2265,9 +2312,10 @@ class VideoAnalysisApp(QMainWindow):
         fig.subplots_adjust(bottom=0.08, top=0.88, left=0.07, right=0.98, hspace=0.12)
 
         # Slider axes (normalized figure coords)
-        ax_s_emg = fig.add_axes([0.08, 0.91, 0.28, 0.03])
-        ax_s_low_freq = fig.add_axes([0.40, 0.91, 0.28, 0.03])
-        ax_s_ratio = fig.add_axes([0.72, 0.91, 0.20, 0.03])
+        ax_s_emg = fig.add_axes([0.05, 0.91, 0.22, 0.03])
+        ax_s_wheel = fig.add_axes([0.30, 0.91, 0.22, 0.03])
+        ax_s_low_freq = fig.add_axes([0.55, 0.91, 0.22, 0.03])
+        ax_s_ratio = fig.add_axes([0.80, 0.91, 0.17, 0.03])
 
         # Data-driven slider ranges
         emg_vals = self.emg_rms_mean_by_epoch
@@ -2306,6 +2354,16 @@ class VideoAnalysisApp(QMainWindow):
         ratio_min = 0.0
         ratio_max = max(ratio_max * 1.05, ratio_min + 1e-6)
 
+        # Wheel slider range
+        wheel_vals = np.asarray(self.wheel_10hz, dtype=float)
+        wheel_finite = wheel_vals[np.isfinite(wheel_vals)]
+        if wheel_finite.size > 0:
+            wheel_max = float(np.nanmax(np.abs(wheel_finite)))
+        else:
+            wheel_max = max(1.0, abs(float(self.locomotion_threshold)))
+        wheel_min = -wheel_max
+        wheel_max = max(wheel_max * 1.05, wheel_min + 1e-6)
+
         # --- Drag callbacks (update slider + rerun classification) ---
         def on_emg_drag(y):
             if self._syncing_slider:
@@ -2343,6 +2401,18 @@ class VideoAnalysisApp(QMainWindow):
                     self._syncing_slider = False
             self._handle_threshold_change()
 
+        def on_wheel_drag(y):
+            if self._syncing_slider:
+                return
+            self.locomotion_threshold = float(y)
+            if self._slider_wheel is not None:
+                self._syncing_slider = True
+                try:
+                    self._slider_wheel.set_val(float(y))
+                finally:
+                    self._syncing_slider = False
+            self._handle_threshold_change()
+
         # Create draggable lines (each owns its line)
         self._thr_drag_emg = DraggableHLine(
             self._ax_emg,
@@ -2363,6 +2433,17 @@ class VideoAnalysisApp(QMainWindow):
             linewidth=1.5,
             tolerance_px=7,
             on_changed=on_low_freq_drag,
+            is_enabled_fn=self._threshold_edit_enabled,
+        )
+
+        self._thr_drag_wheel = DraggableHLine(
+            self._ax_wheel,
+            float(self.locomotion_threshold),
+            color="tab:orange",
+            linestyle="--",
+            linewidth=1.5,
+            tolerance_px=7,
+            on_changed=on_wheel_drag,
             is_enabled_fn=self._threshold_edit_enabled,
         )
 
@@ -2420,6 +2501,27 @@ class VideoAnalysisApp(QMainWindow):
                 self._syncing_slider = False
             self._handle_threshold_change()
 
+        def on_wheel_slider(val):
+            if self._syncing_slider:
+                return
+            if not self._threshold_edit_enabled():
+                self._syncing_slider = True
+                try:
+                    if self._slider_wheel is not None:
+                        self._slider_wheel.set_val(float(self.locomotion_threshold))
+                finally:
+                    self._syncing_slider = False
+                return
+            self._syncing_slider = True
+            try:
+                new_val = float(val)
+                self.locomotion_threshold = new_val
+                if self._thr_drag_wheel is not None:
+                    self._thr_drag_wheel.set_y(new_val, trigger_callback=False)
+            finally:
+                self._syncing_slider = False
+            self._handle_threshold_change()
+
         def on_ratio_slider(val):
             if self._syncing_slider:
                 return
@@ -2444,6 +2546,8 @@ class VideoAnalysisApp(QMainWindow):
         # Create sliders
         self._slider_emg = Slider(ax_s_emg, "", emg_min, emg_max, valinit=float(self.emg_rms_threshold))
         ax_s_emg.set_title("EMG thr", fontsize=9)
+        self._slider_wheel = Slider(ax_s_wheel, "", wheel_min, wheel_max, valinit=float(self.locomotion_threshold))
+        ax_s_wheel.set_title("Wheel thr", fontsize=9)
         self._slider_low_freq = Slider(
             ax_s_low_freq,
             "",
@@ -2456,6 +2560,7 @@ class VideoAnalysisApp(QMainWindow):
         ax_s_ratio.set_title("θ ratio thr", fontsize=9)
 
         self._slider_emg.on_changed(on_emg_slider)
+        self._slider_wheel.on_changed(on_wheel_slider)
         self._slider_low_freq.on_changed(on_low_freq_slider)
         self._slider_ratio.on_changed(on_ratio_slider)
 
@@ -2514,6 +2619,19 @@ class VideoAnalysisApp(QMainWindow):
         ax2.tick_params(axis='y', labelcolor=wheel_color)
         ax2.spines['left'].set_color(wheel_color)
         ax2.tick_params(axis='x', labelbottom=False)
+        try:
+            ax2.patch.set_alpha(0.0)
+        except Exception:
+            pass
+        finite_wheel = np.asarray(self.wheel_10hz, dtype=float)
+        finite_wheel = finite_wheel[np.isfinite(finite_wheel)]
+        if finite_wheel.size > 0:
+            max_abs_wheel = max(np.max(np.abs(finite_wheel)), abs(self.locomotion_threshold), 1e-6)
+            ax2.set_ylim(-max_abs_wheel, max_abs_wheel)
+        else:
+            span = max(abs(self.locomotion_threshold), 1.0)
+            ax2.set_ylim(-span, span)
+        ax2.axhline(0, color="0.7", linestyle="--", linewidth=0.8)
         if (
             isinstance(self.face_motion_10hz, np.ndarray)
             and isinstance(self.face_motion_10hz_t, np.ndarray)
@@ -2530,12 +2648,25 @@ class VideoAnalysisApp(QMainWindow):
                 motion_vals,
                 color="0.4",
                 linewidth=1.0,
-                label="Motion"
+                label="Motion",
+                zorder=4,
             )
             motion_ax.set_ylabel("Motion", color="0.4")
             motion_ax.tick_params(axis='y', labelcolor="0.4")
             motion_ax.spines['top'].set_visible(False)
             motion_ax.spines['right'].set_color("0.4")
+            finite_motion = motion_vals[np.isfinite(motion_vals)]
+            if finite_motion.size > 0:
+                max_abs_motion = max(np.max(np.abs(finite_motion)), 1e-6)
+                motion_ax.set_ylim(-max_abs_motion, max_abs_motion)
+            motion_ax.axhline(0, color="0.6", linestyle="--", linewidth=0.8)
+            try:
+                motion_ax.set_zorder(1)
+                ax2.set_zorder(2)
+                motion_ax.patch.set_alpha(0.0)
+                ax2.patch.set_alpha(0.0)
+            except Exception:
+                pass
 
         # 3) EEG 10 Hz
         ax3 = axs[2]
@@ -2636,6 +2767,7 @@ class VideoAnalysisApp(QMainWindow):
         ax7.spines['right'].set_visible(False)
 
         self._ax_emg = ax1
+        self._ax_wheel = ax2
         self._ax_low_freq = ax5
         self._ax_ratio = ax6
         self._ax_state = ax7

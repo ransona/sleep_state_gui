@@ -537,6 +537,8 @@ def estimate_thresholds_from_epoch_features(epoch_features: Dict) -> Dict[str, f
     Estimate thresholds using trough detection on the available epoch metrics.
     """
 
+    default_locomotion_thr = 0.1
+
     def _resolve(arr):
         arr_vals = _as_float_array(arr)
         thr = _trough_of_bimodal_distribution(arr_vals)
@@ -549,11 +551,11 @@ def estimate_thresholds_from_epoch_features(epoch_features: Dict) -> Dict[str, f
     low_freq = epoch_features.get("low_freq_power_smoothed", epoch_features.get("low_freq_power", []))
     theta_ratio = epoch_features.get("theta_delta_ratio_smoothed", epoch_features.get("theta_ratio_smoothed", []))
     emg_vals = epoch_features.get("emg_rms_mean", [])
-
     return {
         "low_freq_threshold": _resolve(low_freq),
         "theta_ratio_threshold": _resolve(theta_ratio),
         "emg_rms_threshold": _resolve(emg_vals),
+        "locomotion_threshold": default_locomotion_thr,
     }
 
 
@@ -591,6 +593,7 @@ def score_from_epoch_features(
             "theta_ratio_threshold": "theta_ratio_threshold",
             "theta_delta_ratio_threshold": "theta_ratio_threshold",
             "emg_rms_threshold": "emg_rms_threshold",
+            "locomotion_threshold": "locomotion_threshold",
         }
         normalized = {}
         for key, value in thr_dict.items():
@@ -619,18 +622,31 @@ def score_from_epoch_features(
 
     emg = _as_float_array(epoch_features["emg_rms_mean"])
     ratio = _as_float_array(epoch_features["theta_delta_ratio_smoothed"])
+    locomotion = _as_float_array(
+        epoch_features.get("wheel_speed_mean", np.zeros_like(emg))
+    )
 
     n = emg.size
     low_freq = _as_float_array(epoch_features["low_freq_power_smoothed"])
+    if locomotion.size != n:
+        locomotion = np.zeros(n, dtype=float)
     if ratio.size != n or low_freq.size != n:
         raise ValueError("epoch feature arrays must have matching lengths")
 
     emg_thr = resolved.get("emg_rms_threshold", float(np.nan))
     ratio_thr = resolved.get("theta_ratio_threshold", float(np.nan))
     low_freq_thr = resolved.get("low_freq_threshold", float(np.nan))
+    locomotion_thr = resolved.get("locomotion_threshold", 0.1)
+    if not np.isfinite(locomotion_thr):
+        locomotion_thr = 0.1
 
     out = np.empty(n, dtype=np.int8)
     for i in range(n):
+        locomotion_high = (
+            np.isfinite(locomotion[i])
+            and np.isfinite(locomotion_thr)
+            and locomotion[i] > locomotion_thr
+        )
         low_freq_high = (
             np.isfinite(low_freq[i])
             and np.isfinite(low_freq_thr)
@@ -651,7 +667,9 @@ def score_from_epoch_features(
             and np.isfinite(emg_thr)
             and emg[i] >= emg_thr
         )
-        if low_freq_high:
+        if locomotion_high:
+            out[i] = STATE_ACTIVE_WAKE
+        elif low_freq_high:
             out[i] = STATE_NREM
         elif ratio_high and emg_low:
             out[i] = STATE_REM
@@ -1029,10 +1047,12 @@ def run_sleep_scoring(
     emg_threshold = thresholds_used["emg_rms_threshold"]
     theta_ratio_thr = thresholds_used["theta_ratio_threshold"]
     low_freq_thr = thresholds_used["low_freq_threshold"]
+    locomotion_thr = thresholds_used.get("locomotion_threshold", 0.1)
 
     print(f"  - emg_threshold: {emg_threshold:.4f}")
     print(f"  - theta_ratio_thr: {theta_ratio_thr:.4f}")
     print(f"  - low_freq_thr: {low_freq_thr:.4f}")
+    print(f"  - locomotion_thr: {locomotion_thr:.4f}")
 
     # -------------------------------------------------------------
     # 9. downsample to 10 Hz and interpolate states
@@ -1133,6 +1153,7 @@ def run_sleep_scoring(
         "low_freq_threshold": float(low_freq_thr),
         "delta_power_threshold": float(low_freq_thr),
         "wheel_speed_threshold": float(np.nan),
+        "locomotion_threshold": float(locomotion_thr),
 
         # cached epoch features for downstream rescoring
         "epoch_features": {
