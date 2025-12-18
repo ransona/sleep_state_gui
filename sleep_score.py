@@ -613,6 +613,10 @@ def score_from_epoch_features(
             else:
                 resolved[key] = auto_val
 
+    theta_thr = resolved.get("theta_ratio_threshold", float(np.nan))
+    if not np.isfinite(theta_thr):
+        resolved["theta_ratio_threshold"] = 2.0
+
     emg = _as_float_array(epoch_features["emg_rms_mean"])
     ratio = _as_float_array(epoch_features["theta_delta_ratio_smoothed"])
 

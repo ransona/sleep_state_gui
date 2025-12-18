@@ -1139,9 +1139,6 @@ class VideoAnalysisApp(QMainWindow):
         data_min = min(np.nanmin(a) for a in time_arrays if a.size > 0)
         data_max = max(np.nanmax(a) for a in time_arrays if a.size > 0)
 
-        print(f"[DEBUG] Video timeline span (eye_frame_times): {video_min:.3f} to {video_max:.3f} s")
-        print(f"[DEBUG] Sleep data time span: {data_min:.3f} to {data_max:.3f} s")
-
         # slider over 10 Hz timeline
         self.total_frames = len(self.emg_rms_10hz_t)
         if self.total_frames <= 0:
@@ -1447,9 +1444,6 @@ class VideoAnalysisApp(QMainWindow):
         last = frame_text_end
 
         total_elapsed = time.perf_counter() - start_total
-        if self.debug_frame_timing:
-            detail = " | ".join(f"{name}={duration*1000:.1f}ms" for name, duration in timings)
-            print(f"[DEBUG] updateFrame times: {detail} | total={total_elapsed*1000:.1f}ms")
 
     def _close_eye_video_caps(self):
         for attr in ("left_video_cap", "right_video_cap"):
@@ -1635,6 +1629,7 @@ class VideoAnalysisApp(QMainWindow):
         if bounds is None:
             return
         start, end = bounds
+        xlim_snapshot = self._capture_axis_xlimits()
         self.selection_range = (start, end)
         target_ax = patch_ax
         axes = self.figure.axes
@@ -1646,9 +1641,10 @@ class VideoAnalysisApp(QMainWindow):
         if target_ax is not None:
             self._create_selection_patch(target_ax, start, end)
         self._sync_selection_lines_to_range()
+        self._move_cursor_to_time(start)
+        self._restore_axis_xlimits(xlim_snapshot)
         if hasattr(self, "canvas") and self.canvas is not None:
             self.canvas.draw_idle()
-        self._move_cursor_to_time(start)
 
     def _sync_selection_lines_to_range(self):
         if self.selection_range is None:
@@ -1712,6 +1708,33 @@ class VideoAnalysisApp(QMainWindow):
             is_enabled_fn=self._selection_enabled,
         )
         self._sync_selection_lines_to_range()
+
+    def _capture_axis_xlimits(self):
+        axes = getattr(self.figure, "axes", None)
+        if not axes:
+            return None
+        snapshot = []
+        for ax in axes:
+            try:
+                snapshot.append((ax, ax.get_xlim()))
+            except Exception:
+                snapshot.append((ax, None))
+        return snapshot
+
+    def _restore_axis_xlimits(self, snapshot):
+        if not snapshot:
+            return
+        for ax, limits in snapshot:
+            if ax is None or limits is None:
+                continue
+            if len(limits) != 2:
+                continue
+            if not np.all(np.isfinite(limits)):
+                continue
+            try:
+                ax.set_xlim(limits)
+            except Exception:
+                pass
 
     def _remove_selection_vlines(self):
         for vline in (self._selection_line_start, self._selection_line_end):
@@ -2638,7 +2661,15 @@ class VideoAnalysisApp(QMainWindow):
 
         self.canvas.draw()
 
-    def _draw_state_axis(self, ax6):
+    def _draw_state_axis(self, ax6, preserve_xlim=None):
+        if preserve_xlim is not None:
+            try:
+                x_limits = tuple(preserve_xlim)
+            except Exception:
+                x_limits = None
+        else:
+            x_limits = None
+
         ax6.cla()
         ax6.set_ylabel("State")
         ax6.set_xlabel("Time (s)")
@@ -2672,6 +2703,13 @@ class VideoAnalysisApp(QMainWindow):
             for tick, key in zip(ax6.get_yticklabels(), ticks):
                 tick.set_color(color_map.get(key, 'k'))
 
+        if x_limits is not None and len(x_limits) == 2:
+            try:
+                if np.all(np.isfinite(x_limits)):
+                    ax6.set_xlim(x_limits)
+            except Exception:
+                pass
+
     def _update_state_axis_only(self):
         if self._ax_state is None:
             return
@@ -2684,7 +2722,13 @@ class VideoAnalysisApp(QMainWindow):
                 pass
             self.selection_patch = None
 
-        self._draw_state_axis(self._ax_state)
+        x_limits = None
+        try:
+            x_limits = self._ax_state.get_xlim()
+        except Exception:
+            x_limits = None
+
+        self._draw_state_axis(self._ax_state, preserve_xlim=x_limits)
 
         # restore vertical line in state axis and keep others untouched
         current_time = self._current_time()
