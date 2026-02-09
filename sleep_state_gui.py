@@ -275,6 +275,32 @@ class ScoringProgressDialog(QtWidgets.QDialog):
         self.progressBar.setValue(int(round(frac * 100)))
         QApplication.processEvents()
 
+
+class ClipboardSafeLineEdit(QLineEdit):
+    """
+    Prevent deleted/replaced text from lingering in X11 PRIMARY selection.
+    """
+
+    def _clear_primary_selection(self):
+        clipboard = QApplication.clipboard()
+        if clipboard is None:
+            return
+        try:
+            clipboard.clear(mode=QtGui.QClipboard.Selection)
+        except Exception:
+            pass
+
+    def keyPressEvent(self, event):
+        had_selection = self.hasSelectedText()
+        key = event.key()
+        replacing_selection = bool(had_selection and event.text())
+        deleting = key in (Qt.Key_Backspace, Qt.Key_Delete)
+        cutting = event.matches(QtGui.QKeySequence.Cut)
+        super().keyPressEvent(event)
+        if deleting or cutting or replacing_selection:
+            self._clear_primary_selection()
+
+
 class ThresholdHistogramDialog(QtWidgets.QDialog):
     METRIC_CONFIG = [
         ("emg", "EMG RMS mean", "emg_rms_mean_by_epoch", "emg_rms_threshold", "tab:blue"),
@@ -526,6 +552,14 @@ class VideoAnalysisApp(QMainWindow):
 
         self.initUI()
 
+    def _debug_wait(self, tag, message):
+        if not self.debug_frame_timing:
+            return
+        try:
+            print(f"[DEBUG][{tag}] {message}")
+        except Exception:
+            pass
+
     def initUI(self):
         self.setWindowTitle("Sleep State GUI")
         centralWidget = QWidget()
@@ -545,13 +579,13 @@ class VideoAnalysisApp(QMainWindow):
 
         # --- Top input fields (two rows to save width) ---
         inputRow1 = QHBoxLayout()
-        self.userIdEdit = QLineEdit()
+        self.userIdEdit = ClipboardSafeLineEdit()
         self.userIdEdit.setPlaceholderText("Enter User ID")
         self.userIdEdit.setText(DEFAULT_USER_ID)
         inputRow1.addWidget(QLabel("User ID:"))
         inputRow1.addWidget(self.userIdEdit)
 
-        self.expIdEdit = QLineEdit()
+        self.expIdEdit = ClipboardSafeLineEdit()
         self.expIdEdit.setPlaceholderText("Enter Experiment ID")
         self.expIdEdit.setText(DEFAULT_EXP_ID)
         inputRow1.addWidget(QLabel("Exp ID:"))
@@ -1017,6 +1051,10 @@ class VideoAnalysisApp(QMainWindow):
 
         def _progress_cb(fraction, message):
             progress_dialog.update_progress(fraction, message)
+            if self.debug_frame_timing:
+                msg = str(message).lower()
+                if any(token in msg for token in ["wheel", "locomotion", "resampling wheel"]):
+                    self._debug_wait("WAIT_ARDUINO", f"{message} ({float(fraction)*100:.1f}%)")
 
         try:
             sleep_state = run_sleep_scoring(
@@ -1352,12 +1390,28 @@ class VideoAnalysisApp(QMainWindow):
         frame = cv2.circle(frame, center, radius, color, 2)
         return frame
 
-    def playVideoFrame(self, frame_position, cap, eyedat):
+    def playVideoFrame(self, frame_position, cap, eyedat, eye_label="eye"):
         if cap is None or not cap.isOpened():
             return None
+        seek_start = time.perf_counter()
         cap.set(cv2.CAP_PROP_POS_FRAMES, int(frame_position))
+        seek_elapsed = time.perf_counter() - seek_start
+        if seek_elapsed > 0.01:
+            self._debug_wait(
+                "WAIT_FRAME",
+                f"{eye_label}: seek frame {int(frame_position)} took {seek_elapsed*1000:.1f} ms",
+            )
+
+        read_start = time.perf_counter()
         ret, frame = cap.read()
+        read_elapsed = time.perf_counter() - read_start
+        if read_elapsed > 0.01:
+            self._debug_wait(
+                "WAIT_FRAME",
+                f"{eye_label}: read frame {int(frame_position)} took {read_elapsed*1000:.1f} ms",
+            )
         if not ret or frame is None:
+            self._debug_wait("WAIT_FRAME", f"{eye_label}: read failed at frame {int(frame_position)}")
             return None
 
         frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
@@ -1421,6 +1475,7 @@ class VideoAnalysisApp(QMainWindow):
                 idx_frame,
                 self.left_video_cap,
                 self.left_eyedat,
+                eye_label="left",
             )
             if frame_left is not None:
                 image_left = QtGui.QImage(
@@ -1434,6 +1489,7 @@ class VideoAnalysisApp(QMainWindow):
                 idx_frame,
                 self.right_video_cap,
                 self.right_eyedat,
+                eye_label="right",
             )
             if frame_right is not None:
                 image_right = QtGui.QImage(
