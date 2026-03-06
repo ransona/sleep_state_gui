@@ -82,6 +82,10 @@ class DraggableHLine:
                 self.canvas.mpl_disconnect(cid)
             except Exception:
                 pass
+        try:
+            self.line.remove()
+        except Exception:
+            pass
 
     def get_y(self):
         return float(self.line.get_ydata()[0])
@@ -193,6 +197,12 @@ class DraggableVLine:
                     self.canvas.mpl_disconnect(cid)
             except Exception:
                 pass
+        for line in self.lines:
+            try:
+                line.remove()
+            except Exception:
+                pass
+        self.lines = []
 
     def get_x(self):
         if not self.lines:
@@ -584,6 +594,7 @@ class VideoAnalysisApp(QMainWindow):
         self.theta_delta_ratio_threshold = None
         self.delta_power_threshold = None
         self.locomotion_threshold = 0.1
+        self._saved_threshold_values = {}
 
         # eye frame times
         self.eye_frame_times = None
@@ -634,6 +645,7 @@ class VideoAnalysisApp(QMainWindow):
         self._slider_low_freq = None
         self._slider_ratio = None
         self._slider_wheel = None
+        self._threshold_slider_axes = []
 
         self._syncing_slider = False
         self._syncing_spec_sliders = False
@@ -839,13 +851,7 @@ class VideoAnalysisApp(QMainWindow):
         self.locSdEdit.setFixedWidth(60)
         self.locSdEdit.setEnabled(False)
         self.locSdEdit.editingFinished.connect(self.plotTraces)
-        locRow.addSpacing(8)
-        locRow.addWidget(QLabel("Locomotion thr (wake):"))
-        self.locomotionThresholdEdit = QLineEdit("0.1")
-        self.locomotionThresholdEdit.setFixedWidth(70)
-        self.locomotionThresholdEdit.setEnabled(False)
-        self.locomotionThresholdEdit.editingFinished.connect(self._on_locomotion_threshold_changed)
-        locRow.addWidget(self.locomotionThresholdEdit)
+        locRow.addStretch(1)
         controlsLayout.addLayout(locRow)
 
         modeRow1 = QHBoxLayout()
@@ -868,15 +874,15 @@ class VideoAnalysisApp(QMainWindow):
         self.autoRescoreCheck.setChecked(False)
         modeRow2.addWidget(self.autoRescoreCheck)
 
-        self.rescoreButton = QPushButton("Rescore")
-        self.rescoreButton.setEnabled(False)
-        self.rescoreButton.clicked.connect(self.onRescoreClicked)
-        modeRow2.addWidget(self.rescoreButton)
-
         self.histogramButton = QPushButton("Show distributions")
         self.histogramButton.setEnabled(False)
         self.histogramButton.clicked.connect(self.show_threshold_histogram_dialog)
         modeRow2.addWidget(self.histogramButton)
+
+        self.revertThresholdsButton = QPushButton("Revert thresholds")
+        self.revertThresholdsButton.setEnabled(False)
+        self.revertThresholdsButton.clicked.connect(self.revertThresholdsToSaved)
+        modeRow2.addWidget(self.revertThresholdsButton)
 
         self.saveButton = QPushButton("Save scoring")
         self.saveButton.setEnabled(False)
@@ -918,7 +924,48 @@ class VideoAnalysisApp(QMainWindow):
         controlsLayout.addLayout(stateAssignLayout)
         self.state_buttons = []
 
+        thresholdPanel = QWidget()
+        thresholdPanelLayout = QtWidgets.QGridLayout(thresholdPanel)
+        thresholdPanelLayout.setContentsMargins(0, 0, 0, 0)
+        thresholdPanelLayout.setHorizontalSpacing(8)
+        thresholdPanelLayout.setVerticalSpacing(4)
+        thresholdPanelLayout.addWidget(QLabel("Thresholds"), 0, 0, 1, 4)
+
+        self.emgThresholdEdit = QLineEdit("")
+        self.lowFreqThresholdEdit = QLineEdit("")
+        self.ratioThresholdEdit = QLineEdit("")
+        self.locomotionThresholdEdit = QLineEdit("")
+        for edit in [
+            self.emgThresholdEdit,
+            self.lowFreqThresholdEdit,
+            self.ratioThresholdEdit,
+            self.locomotionThresholdEdit,
+        ]:
+            edit.setFixedWidth(90)
+            edit.setEnabled(False)
+            edit.editingFinished.connect(self._on_threshold_text_edit_finished)
+
+        thresholdPanelLayout.addWidget(QLabel("EMG"), 1, 0)
+        thresholdPanelLayout.addWidget(self.emgThresholdEdit, 1, 1)
+        thresholdPanelLayout.addWidget(QLabel("Low-freq"), 1, 2)
+        thresholdPanelLayout.addWidget(self.lowFreqThresholdEdit, 1, 3)
+        thresholdPanelLayout.addWidget(QLabel("Theta ratio"), 2, 0)
+        thresholdPanelLayout.addWidget(self.ratioThresholdEdit, 2, 1)
+        thresholdPanelLayout.addWidget(QLabel("Locomotion"), 2, 2)
+        thresholdPanelLayout.addWidget(self.locomotionThresholdEdit, 2, 3)
+        controlsLayout.addWidget(thresholdPanel)
+
         controlsLayout.addStretch(1)
+
+        self.rescoreButton = QPushButton("Rescore")
+        self.rescoreButton.setEnabled(False)
+        self.rescoreButton.clicked.connect(self.onRescoreClicked)
+        self.rescoreButton.setStyleSheet(
+            "QPushButton { background-color: #1f9d55; color: white; font-weight: 600; padding: 8px; }"
+            "QPushButton:disabled { background-color: #8abf9f; color: #f3f3f3; }"
+        )
+        self.rescoreButton.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        controlsLayout.addWidget(self.rescoreButton)
 
         # --- Matplotlib canvas ---
         self.figure = Figure(figsize=(8, 8))
@@ -1373,7 +1420,10 @@ class VideoAnalysisApp(QMainWindow):
         self.specRangeMaxSlider.setEnabled(True)
         self.locSdEdit.setEnabled(True)
         self.locomotionThresholdEdit.setEnabled(True)
-        self.locomotionThresholdEdit.setText(f"{self.locomotion_threshold:.3f}")
+        self.emgThresholdEdit.setEnabled(True)
+        self.lowFreqThresholdEdit.setEnabled(True)
+        self.ratioThresholdEdit.setEnabled(True)
+        self.revertThresholdsButton.setEnabled(True)
         sat_pct = self._parse_saturation_percent()
         self.spec_range_manual = False
         self._set_spec_percentiles_from_saturation(sat_pct, update_sliders=True)
@@ -1397,6 +1447,8 @@ class VideoAnalysisApp(QMainWindow):
 
         self.loaded = True
         self._state_dirty = False
+        self._capture_saved_threshold_values()
+        self._sync_threshold_widgets_to_values()
 
         self._rebuild_epoch_features()
         self._refresh_state_controls()
@@ -2448,6 +2500,7 @@ class VideoAnalysisApp(QMainWindow):
             return
 
         self.loaded_sleep_state = sleep_state
+        self._capture_saved_threshold_values()
         self._state_dirty = False
         self._update_save_button_state()
         QMessageBox.information(self, "Sleep scoring", "Updated sleep scoring data saved successfully.")
@@ -2476,9 +2529,107 @@ class VideoAnalysisApp(QMainWindow):
         )
 
     def _handle_threshold_change(self):
+        self._sync_threshold_text_boxes()
         self._state_dirty = True
         self._update_save_button_state()
         if self._auto_rescore_enabled():
+            self.rerun_classification()
+
+    def _sync_threshold_text_boxes(self):
+        if hasattr(self, "emgThresholdEdit"):
+            self.emgThresholdEdit.setText(f"{float(self.emg_rms_threshold):.4g}")
+        if hasattr(self, "lowFreqThresholdEdit"):
+            self.lowFreqThresholdEdit.setText(f"{float(self.low_freq_threshold):.4g}")
+        if hasattr(self, "ratioThresholdEdit"):
+            self.ratioThresholdEdit.setText(f"{float(self.theta_delta_ratio_threshold):.4g}")
+        if hasattr(self, "locomotionThresholdEdit"):
+            self.locomotionThresholdEdit.setText(f"{float(self.locomotion_threshold):.4g}")
+
+    def _update_threshold_slider_captions(self):
+        pairs = [
+            (self._slider_emg, "EMG", self.emg_rms_threshold),
+            (self._slider_wheel, "Locomotion", self.locomotion_threshold),
+            (self._slider_low_freq, "Low-freq", self.low_freq_threshold),
+            (self._slider_ratio, "Theta ratio", self.theta_delta_ratio_threshold),
+        ]
+        for slider, name, value in pairs:
+            if slider is None:
+                continue
+            try:
+                slider.label.set_text(f"{name}: {float(value):.4g}")
+                slider.label.set_transform(slider.ax.transAxes)
+                slider.label.set_position((0.0, 1.15))
+                slider.label.set_ha("left")
+                slider.label.set_va("bottom")
+                slider.label.set_fontsize(8)
+                slider.label.set_clip_on(False)
+            except Exception:
+                pass
+
+    def _rebuild_threshold_widgets_for_current_values(self):
+        if not self.loaded:
+            return
+        if self._axs is None:
+            return
+        self._setup_threshold_widgets()
+        self.onModeToggled()
+
+    def _threshold_outside_slider_ranges(self):
+        checks = [
+            (self._slider_emg, self.emg_rms_threshold),
+            (self._slider_wheel, self.locomotion_threshold),
+            (self._slider_low_freq, self.low_freq_threshold),
+            (self._slider_ratio, self.theta_delta_ratio_threshold),
+        ]
+        for slider, value in checks:
+            if slider is None:
+                return True
+            try:
+                v = float(value)
+                if not np.isfinite(v):
+                    continue
+                if v < float(slider.valmin) or v > float(slider.valmax):
+                    return True
+            except Exception:
+                return True
+        return False
+
+    def _current_threshold_values(self):
+        return {
+            "emg_rms_threshold": float(self.emg_rms_threshold),
+            "low_freq_threshold": float(self.low_freq_threshold),
+            "theta_delta_ratio_threshold": float(self.theta_delta_ratio_threshold),
+            "locomotion_threshold": float(self.locomotion_threshold),
+        }
+
+    def _capture_saved_threshold_values(self):
+        self._saved_threshold_values = self._current_threshold_values()
+
+    def _apply_threshold_values(self, values):
+        self.emg_rms_threshold = float(values["emg_rms_threshold"])
+        self.low_freq_threshold = float(values["low_freq_threshold"])
+        self.theta_delta_ratio_threshold = float(values["theta_delta_ratio_threshold"])
+        self.locomotion_threshold = float(values["locomotion_threshold"])
+
+    def _on_threshold_text_edit_finished(self):
+        if not self.loaded:
+            return
+        try:
+            values = {
+                "emg_rms_threshold": float(self.emgThresholdEdit.text()),
+                "low_freq_threshold": float(self.lowFreqThresholdEdit.text()),
+                "theta_delta_ratio_threshold": float(self.ratioThresholdEdit.text()),
+                "locomotion_threshold": float(self.locomotionThresholdEdit.text()),
+            }
+        except Exception:
+            self._sync_threshold_widgets_to_values()
+            return
+        self._apply_threshold_values(values)
+        if self._threshold_outside_slider_ranges():
+            self._rebuild_threshold_widgets_for_current_values()
+        self._sync_threshold_widgets_to_values()
+        self._handle_threshold_change()
+        if not self._auto_rescore_enabled():
             self.rerun_classification()
 
     def _on_locomotion_threshold_changed(self):
@@ -2487,7 +2638,20 @@ class VideoAnalysisApp(QMainWindow):
         except Exception:
             return
         self.locomotion_threshold = new_val
+        if self._threshold_outside_slider_ranges():
+            self._rebuild_threshold_widgets_for_current_values()
+        self._sync_threshold_widgets_to_values()
         self._handle_threshold_change()
+
+    def revertThresholdsToSaved(self):
+        if not self.loaded:
+            return
+        if not self._saved_threshold_values:
+            return
+        self._apply_threshold_values(self._saved_threshold_values)
+        self._rebuild_threshold_widgets_for_current_values()
+        self._sync_threshold_widgets_to_values()
+        self.rerun_classification()
 
     def show_threshold_histogram_dialog(self):
         if not self.loaded:
@@ -2551,7 +2715,7 @@ class VideoAnalysisApp(QMainWindow):
         if not selection_active:
             self._clear_selection_visuals()
         slider_active = self._threshold_edit_enabled()
-        for slider in [self._slider_emg, self._slider_low_freq, self._slider_ratio]:
+        for slider in [self._slider_emg, self._slider_wheel, self._slider_low_freq, self._slider_ratio]:
             if slider is not None:
                 try:
                     slider.set_active(slider_active)
@@ -2620,15 +2784,10 @@ class VideoAnalysisApp(QMainWindow):
             self.state_shortcut_map[shortcut_key] = state_id
 
     def _sync_threshold_widgets_to_values(self):
-        if (
-            self._thr_drag_emg is None
-            and self._thr_drag_low_freq is None
-            and self._thr_drag_ratio is None
-            and self._thr_drag_wheel is None
-        ):
-            return
         self._syncing_slider = True
         try:
+            self._sync_threshold_text_boxes()
+
             if self._thr_drag_emg is not None:
                 self._thr_drag_emg.set_y(float(self.emg_rms_threshold), trigger_callback=False)
             if self._slider_emg is not None:
@@ -2648,6 +2807,7 @@ class VideoAnalysisApp(QMainWindow):
                 self._thr_drag_ratio.set_y(float(self.theta_delta_ratio_threshold), trigger_callback=False)
             if self._slider_ratio is not None:
                 self._slider_ratio.set_val(float(self.theta_delta_ratio_threshold))
+            self._update_threshold_slider_captions()
         except Exception:
             pass
         finally:
@@ -2669,6 +2829,12 @@ class VideoAnalysisApp(QMainWindow):
         self._slider_wheel = None
         self._slider_low_freq = None
         self._slider_ratio = None
+        for ax in self._threshold_slider_axes:
+            try:
+                ax.remove()
+            except Exception:
+                pass
+        self._threshold_slider_axes = []
 
     def _setup_threshold_widgets(self):
         """
@@ -2683,13 +2849,14 @@ class VideoAnalysisApp(QMainWindow):
         fig = self.figure
 
         # Reserve space at bottom for sliders
-        fig.subplots_adjust(bottom=0.08, top=0.88, left=0.07, right=0.98, hspace=0.12)
+        fig.subplots_adjust(bottom=0.08, top=0.87, left=0.07, right=0.98, hspace=0.12)
 
         # Slider axes (normalized figure coords)
-        ax_s_emg = fig.add_axes([0.05, 0.91, 0.22, 0.03])
-        ax_s_wheel = fig.add_axes([0.30, 0.91, 0.22, 0.03])
-        ax_s_low_freq = fig.add_axes([0.55, 0.91, 0.22, 0.03])
-        ax_s_ratio = fig.add_axes([0.80, 0.91, 0.17, 0.03])
+        ax_s_emg = fig.add_axes([0.03, 0.91, 0.17, 0.03])
+        ax_s_wheel = fig.add_axes([0.27, 0.91, 0.17, 0.03])
+        ax_s_low_freq = fig.add_axes([0.51, 0.91, 0.17, 0.03])
+        ax_s_ratio = fig.add_axes([0.75, 0.91, 0.17, 0.03])
+        self._threshold_slider_axes = [ax_s_emg, ax_s_wheel, ax_s_low_freq, ax_s_ratio]
 
         # Data-driven slider ranges
         emg_vals = self.emg_rms_mean_by_epoch
@@ -2701,6 +2868,9 @@ class VideoAnalysisApp(QMainWindow):
         else:
             emg_max = max(1.0, float(self.emg_rms_threshold))
         emg_min = 0.0
+        if np.isfinite(self.emg_rms_threshold):
+            emg_min = min(emg_min, float(self.emg_rms_threshold))
+            emg_max = max(emg_max, float(self.emg_rms_threshold))
         emg_max = max(emg_max * 1.05, emg_min + 1e-6)
 
         low_freq_vals = self.low_freq_power
@@ -2714,6 +2884,9 @@ class VideoAnalysisApp(QMainWindow):
             fallback_span = abs(float(self.low_freq_threshold)) if np.isfinite(self.low_freq_threshold) else 1.0
             low_freq_min = -fallback_span
             low_freq_max = fallback_span
+        if np.isfinite(self.low_freq_threshold):
+            low_freq_min = min(low_freq_min, float(self.low_freq_threshold))
+            low_freq_max = max(low_freq_max, float(self.low_freq_threshold))
         low_freq_max = max(low_freq_max, low_freq_min + 1e-6)
         span = low_freq_max - low_freq_min
         if span <= 0:
@@ -2726,6 +2899,9 @@ class VideoAnalysisApp(QMainWindow):
         else:
             ratio_max = max(1.0, float(self.theta_delta_ratio_threshold))
         ratio_min = 0.0
+        if np.isfinite(self.theta_delta_ratio_threshold):
+            ratio_min = min(ratio_min, float(self.theta_delta_ratio_threshold))
+            ratio_max = max(ratio_max, float(self.theta_delta_ratio_threshold))
         ratio_max = max(ratio_max * 1.05, ratio_min + 1e-6)
 
         # Wheel slider range
@@ -2735,6 +2911,8 @@ class VideoAnalysisApp(QMainWindow):
             wheel_max = float(np.nanmax(np.abs(wheel_finite)))
         else:
             wheel_max = max(1.0, abs(float(self.locomotion_threshold)))
+        if np.isfinite(self.locomotion_threshold):
+            wheel_max = max(wheel_max, abs(float(self.locomotion_threshold)))
         wheel_min = -wheel_max
         wheel_max = max(wheel_max * 1.05, wheel_min + 1e-6)
 
@@ -2743,6 +2921,7 @@ class VideoAnalysisApp(QMainWindow):
             if self._syncing_slider:
                 return
             self.emg_rms_threshold = float(y)
+            self._update_threshold_slider_captions()
             if self._slider_emg is not None:
                 self._syncing_slider = True
                 try:
@@ -2755,6 +2934,7 @@ class VideoAnalysisApp(QMainWindow):
             if self._syncing_slider:
                 return
             self.low_freq_threshold = float(y)
+            self._update_threshold_slider_captions()
             if self._slider_low_freq is not None:
                 self._syncing_slider = True
                 try:
@@ -2767,6 +2947,7 @@ class VideoAnalysisApp(QMainWindow):
             if self._syncing_slider:
                 return
             self.theta_delta_ratio_threshold = float(y)
+            self._update_threshold_slider_captions()
             if self._slider_ratio is not None:
                 self._syncing_slider = True
                 try:
@@ -2779,6 +2960,7 @@ class VideoAnalysisApp(QMainWindow):
             if self._syncing_slider:
                 return
             self.locomotion_threshold = float(y)
+            self._update_threshold_slider_captions()
             if self._slider_wheel is not None:
                 self._syncing_slider = True
                 try:
@@ -2850,6 +3032,7 @@ class VideoAnalysisApp(QMainWindow):
                 self.emg_rms_threshold = new_val
                 if self._thr_drag_emg is not None:
                     self._thr_drag_emg.set_y(new_val, trigger_callback=False)
+                self._update_threshold_slider_captions()
             finally:
                 self._syncing_slider = False
             self._handle_threshold_change()
@@ -2871,6 +3054,7 @@ class VideoAnalysisApp(QMainWindow):
                 self.low_freq_threshold = new_val
                 if self._thr_drag_low_freq is not None:
                     self._thr_drag_low_freq.set_y(new_val, trigger_callback=False)
+                self._update_threshold_slider_captions()
             finally:
                 self._syncing_slider = False
             self._handle_threshold_change()
@@ -2892,6 +3076,7 @@ class VideoAnalysisApp(QMainWindow):
                 self.locomotion_threshold = new_val
                 if self._thr_drag_wheel is not None:
                     self._thr_drag_wheel.set_y(new_val, trigger_callback=False)
+                self._update_threshold_slider_captions()
             finally:
                 self._syncing_slider = False
             self._handle_threshold_change()
@@ -2913,25 +3098,29 @@ class VideoAnalysisApp(QMainWindow):
                 self.theta_delta_ratio_threshold = new_val
                 if self._thr_drag_ratio is not None:
                     self._thr_drag_ratio.set_y(new_val, trigger_callback=False)
+                self._update_threshold_slider_captions()
             finally:
                 self._syncing_slider = False
             self._handle_threshold_change()
 
         # Create sliders
-        self._slider_emg = Slider(ax_s_emg, "", emg_min, emg_max, valinit=float(self.emg_rms_threshold))
-        ax_s_emg.set_title("EMG thr", fontsize=9)
-        self._slider_wheel = Slider(ax_s_wheel, "", wheel_min, wheel_max, valinit=float(self.locomotion_threshold))
-        ax_s_wheel.set_title("Wheel thr", fontsize=9)
+        self._slider_emg = Slider(ax_s_emg, "EMG", emg_min, emg_max, valinit=float(self.emg_rms_threshold))
+        self._slider_wheel = Slider(ax_s_wheel, "Locomotion", wheel_min, wheel_max, valinit=float(self.locomotion_threshold))
         self._slider_low_freq = Slider(
             ax_s_low_freq,
-            "",
+            "Low-freq",
             low_freq_min,
             low_freq_max,
             valinit=float(self.low_freq_threshold),
         )
-        ax_s_low_freq.set_title("Low-freq thr", fontsize=9)
-        self._slider_ratio = Slider(ax_s_ratio, "", ratio_min, ratio_max, valinit=float(self.theta_delta_ratio_threshold))
-        ax_s_ratio.set_title("θ ratio thr", fontsize=9)
+        self._slider_ratio = Slider(ax_s_ratio, "Theta ratio", ratio_min, ratio_max, valinit=float(self.theta_delta_ratio_threshold))
+
+        for sl in [self._slider_emg, self._slider_wheel, self._slider_low_freq, self._slider_ratio]:
+            try:
+                sl.valtext.set_visible(False)
+            except Exception:
+                pass
+        self._update_threshold_slider_captions()
 
         self._slider_emg.on_changed(on_emg_slider)
         self._slider_wheel.on_changed(on_wheel_slider)
@@ -3320,6 +3509,10 @@ class VideoAnalysisApp(QMainWindow):
     # Main
     # -----------------------------
 if __name__ == "__main__":
+    # Prefer software GL on X11 to avoid noisy GLX FBConfig/XVisual fallback warnings.
+    os.environ.setdefault("QT_OPENGL", "software")
+    os.environ.setdefault("QT_XCB_GL_INTEGRATION", "none")
+    QtCore.QCoreApplication.setAttribute(Qt.AA_UseSoftwareOpenGL, True)
     app = QApplication(sys.argv)
     win = VideoAnalysisApp()
     win.showMaximized()
