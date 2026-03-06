@@ -589,7 +589,6 @@ def score_from_epoch_features(
         mapping = {
             "low_freq_threshold": "low_freq_threshold",
             "delta_power_threshold": "low_freq_threshold",
-            "wheel_speed_threshold": "low_freq_threshold",
             "theta_ratio_threshold": "theta_ratio_threshold",
             "theta_delta_ratio_threshold": "theta_ratio_threshold",
             "emg_rms_threshold": "emg_rms_threshold",
@@ -1152,7 +1151,6 @@ def run_sleep_scoring(
         "theta_delta_ratio_threshold": float(theta_ratio_thr),
         "low_freq_threshold": float(low_freq_thr),
         "delta_power_threshold": float(low_freq_thr),
-        "wheel_speed_threshold": float(np.nan),
         "locomotion_threshold": float(locomotion_thr),
 
         # cached epoch features for downstream rescoring

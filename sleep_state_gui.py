@@ -540,6 +540,10 @@ class VideoAnalysisApp(QMainWindow):
         self._slider_wheel = None
 
         self._syncing_slider = False
+        self._syncing_spec_sliders = False
+        self.spec_range_manual = False
+        self.spec_min_percentile = 5.0
+        self.spec_max_percentile = 95.0
 
         # cached epoch features for reclassification
         self.emg_rms_mean_by_epoch = None
@@ -551,14 +555,6 @@ class VideoAnalysisApp(QMainWindow):
         self._histogram_dialog = None
 
         self.initUI()
-
-    def _debug_wait(self, tag, message):
-        if not self.debug_frame_timing:
-            return
-        try:
-            print(f"[DEBUG][{tag}] {message}")
-        except Exception:
-            pass
 
     def initUI(self):
         self.setWindowTitle("Sleep State GUI")
@@ -680,9 +676,31 @@ class VideoAnalysisApp(QMainWindow):
         self.satPercentEdit = QLineEdit("90")
         self.satPercentEdit.setFixedWidth(60)
         self.satPercentEdit.setEnabled(False)
-        self.satPercentEdit.editingFinished.connect(self.plotTraces)
+        self.satPercentEdit.editingFinished.connect(self._on_sat_percent_changed)
         satRow.addWidget(self.satPercentEdit)
         controlsLayout.addLayout(satRow)
+
+        specRangeRow = QHBoxLayout()
+        self.specMinLabel = QLabel("Spec min pct: 5.0")
+        self.specRangeMinSlider = QSlider(Qt.Horizontal)
+        self.specRangeMinSlider.setRange(0, 1000)  # 0.0..100.0 percentile
+        self.specRangeMinSlider.setValue(50)
+        self.specRangeMinSlider.setEnabled(False)
+        self.specRangeMinSlider.valueChanged.connect(self._on_spec_min_slider_changed)
+        specRangeRow.addWidget(self.specMinLabel)
+        specRangeRow.addWidget(self.specRangeMinSlider)
+        controlsLayout.addLayout(specRangeRow)
+
+        specRangeRow2 = QHBoxLayout()
+        self.specMaxLabel = QLabel("Spec max pct: 95.0")
+        self.specRangeMaxSlider = QSlider(Qt.Horizontal)
+        self.specRangeMaxSlider.setRange(0, 1000)  # 0.0..100.0 percentile
+        self.specRangeMaxSlider.setValue(950)
+        self.specRangeMaxSlider.setEnabled(False)
+        self.specRangeMaxSlider.valueChanged.connect(self._on_spec_max_slider_changed)
+        specRangeRow2.addWidget(self.specMaxLabel)
+        specRangeRow2.addWidget(self.specRangeMaxSlider)
+        controlsLayout.addLayout(specRangeRow2)
 
         locRow = QHBoxLayout()
         locRow.addWidget(QLabel("Locomotion SD (mask):"))
@@ -1051,10 +1069,6 @@ class VideoAnalysisApp(QMainWindow):
 
         def _progress_cb(fraction, message):
             progress_dialog.update_progress(fraction, message)
-            if self.debug_frame_timing:
-                msg = str(message).lower()
-                if any(token in msg for token in ["wheel", "locomotion", "resampling wheel"]):
-                    self._debug_wait("WAIT_ARDUINO", f"{message} ({float(fraction)*100:.1f}%)")
 
         try:
             sleep_state = run_sleep_scoring(
@@ -1118,7 +1132,6 @@ class VideoAnalysisApp(QMainWindow):
         low_freq_candidates = [
             sleep_state.get("low_freq_threshold"),
             sleep_state.get("delta_power_threshold"),
-            sleep_state.get("wheel_speed_threshold"),
         ]
         low_freq_thr = next(
             (float(val) for val in low_freq_candidates if val is not None and np.isfinite(float(val))),
@@ -1221,9 +1234,14 @@ class VideoAnalysisApp(QMainWindow):
         self.frameJumpEdit.setText(f"{self.emg_rms_10hz_t[0]:.3f}")
 
         self.satPercentEdit.setEnabled(True)
+        self.specRangeMinSlider.setEnabled(True)
+        self.specRangeMaxSlider.setEnabled(True)
         self.locSdEdit.setEnabled(True)
         self.locomotionThresholdEdit.setEnabled(True)
         self.locomotionThresholdEdit.setText(f"{self.locomotion_threshold:.3f}")
+        sat_pct = self._parse_saturation_percent()
+        self.spec_range_manual = False
+        self._set_spec_percentiles_from_saturation(sat_pct, update_sliders=True)
         self.modeThresholdButton.setEnabled(True)
         self.modeSelectionButton.setEnabled(True)
         self.modeSelectionButton.setChecked(True)
@@ -1390,28 +1408,12 @@ class VideoAnalysisApp(QMainWindow):
         frame = cv2.circle(frame, center, radius, color, 2)
         return frame
 
-    def playVideoFrame(self, frame_position, cap, eyedat, eye_label="eye"):
+    def playVideoFrame(self, frame_position, cap, eyedat):
         if cap is None or not cap.isOpened():
             return None
-        seek_start = time.perf_counter()
         cap.set(cv2.CAP_PROP_POS_FRAMES, int(frame_position))
-        seek_elapsed = time.perf_counter() - seek_start
-        if seek_elapsed > 0.01:
-            self._debug_wait(
-                "WAIT_FRAME",
-                f"{eye_label}: seek frame {int(frame_position)} took {seek_elapsed*1000:.1f} ms",
-            )
-
-        read_start = time.perf_counter()
         ret, frame = cap.read()
-        read_elapsed = time.perf_counter() - read_start
-        if read_elapsed > 0.01:
-            self._debug_wait(
-                "WAIT_FRAME",
-                f"{eye_label}: read frame {int(frame_position)} took {read_elapsed*1000:.1f} ms",
-            )
         if not ret or frame is None:
-            self._debug_wait("WAIT_FRAME", f"{eye_label}: read failed at frame {int(frame_position)}")
             return None
 
         frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
@@ -1452,6 +1454,79 @@ class VideoAnalysisApp(QMainWindow):
         if self.loaded:
             self.plotTraces()
 
+    def _parse_saturation_percent(self):
+        try:
+            sat_pct = float(self.satPercentEdit.text())
+        except Exception:
+            sat_pct = 90.0
+        sat_pct = min(max(sat_pct, 1.0), 99.0)
+        return sat_pct
+
+    def _update_spec_slider_labels(self):
+        self.specMinLabel.setText(f"Spec min pct: {self.spec_min_percentile:.1f}")
+        self.specMaxLabel.setText(f"Spec max pct: {self.spec_max_percentile:.1f}")
+
+    def _set_spec_percentiles_from_saturation(self, sat_pct, update_sliders=True):
+        low_p = (100.0 - float(sat_pct)) / 2.0
+        high_p = 100.0 - low_p
+        self.spec_min_percentile = min(max(low_p, 0.0), 100.0)
+        self.spec_max_percentile = min(max(high_p, 0.0), 100.0)
+        if self.spec_max_percentile <= self.spec_min_percentile:
+            self.spec_max_percentile = min(100.0, self.spec_min_percentile + 0.1)
+        if update_sliders:
+            self._syncing_spec_sliders = True
+            try:
+                self.specRangeMinSlider.setValue(int(round(self.spec_min_percentile * 10.0)))
+                self.specRangeMaxSlider.setValue(int(round(self.spec_max_percentile * 10.0)))
+            finally:
+                self._syncing_spec_sliders = False
+        self._update_spec_slider_labels()
+
+    def _on_sat_percent_changed(self):
+        sat_pct = self._parse_saturation_percent()
+        self.satPercentEdit.setText(f"{sat_pct:.1f}")
+        # Editing saturation re-enables saturation-driven scaling.
+        self.spec_range_manual = False
+        self._set_spec_percentiles_from_saturation(sat_pct, update_sliders=True)
+        if self.loaded:
+            self.plotTraces()
+
+    def _on_spec_min_slider_changed(self, raw_value):
+        if self._syncing_spec_sliders:
+            return
+        new_min = float(raw_value) / 10.0
+        max_p = float(self.spec_max_percentile)
+        if new_min >= max_p:
+            new_min = max(0.0, max_p - 0.1)
+            self._syncing_spec_sliders = True
+            try:
+                self.specRangeMinSlider.setValue(int(round(new_min * 10.0)))
+            finally:
+                self._syncing_spec_sliders = False
+        self.spec_min_percentile = new_min
+        self.spec_range_manual = True
+        self._update_spec_slider_labels()
+        if self.loaded:
+            self.plotTraces()
+
+    def _on_spec_max_slider_changed(self, raw_value):
+        if self._syncing_spec_sliders:
+            return
+        new_max = float(raw_value) / 10.0
+        min_p = float(self.spec_min_percentile)
+        if new_max <= min_p:
+            new_max = min(100.0, min_p + 0.1)
+            self._syncing_spec_sliders = True
+            try:
+                self.specRangeMaxSlider.setValue(int(round(new_max * 10.0)))
+            finally:
+                self._syncing_spec_sliders = False
+        self.spec_max_percentile = new_max
+        self.spec_range_manual = True
+        self._update_spec_slider_labels()
+        if self.loaded:
+            self.plotTraces()
+
     def updateFrame(self):
         if not self.loaded:
             return
@@ -1475,7 +1550,6 @@ class VideoAnalysisApp(QMainWindow):
                 idx_frame,
                 self.left_video_cap,
                 self.left_eyedat,
-                eye_label="left",
             )
             if frame_left is not None:
                 image_left = QtGui.QImage(
@@ -1489,7 +1563,6 @@ class VideoAnalysisApp(QMainWindow):
                 idx_frame,
                 self.right_video_cap,
                 self.right_eyedat,
-                eye_label="right",
             )
             if frame_right is not None:
                 image_right = QtGui.QImage(
@@ -2112,7 +2185,6 @@ class VideoAnalysisApp(QMainWindow):
         sleep_state["theta_delta_ratio_threshold"] = float(self.theta_delta_ratio_threshold)
         sleep_state["low_freq_threshold"] = float(self.low_freq_threshold)
         sleep_state["delta_power_threshold"] = float(self.low_freq_threshold)
-        sleep_state["wheel_speed_threshold"] = float(self.low_freq_threshold)
         sleep_state["locomotion_threshold"] = float(self.locomotion_threshold)
 
         if self.epoch_features_data is not None:
@@ -2627,12 +2699,20 @@ class VideoAnalysisApp(QMainWindow):
         if not hasattr(self, "emg_rms_10hz"):
             return
 
+        # Preserve current zoom/pan limits when redrawing the figure.
+        prev_limits = None
+        if isinstance(self._axs, np.ndarray) and self._axs.size >= 7:
+            prev_limits = []
+            for ax in self._axs[:7]:
+                try:
+                    prev_limits.append((ax.get_xlim(), ax.get_ylim()))
+                except Exception:
+                    prev_limits.append((None, None))
+
         # saturation percentage
-        try:
-            sat_pct = float(self.satPercentEdit.text())
-        except Exception:
-            sat_pct = 90.0
-        sat_pct = min(max(sat_pct, 1.0), 99.0)
+        sat_pct = self._parse_saturation_percent()
+        if not self.spec_range_manual:
+            self._set_spec_percentiles_from_saturation(sat_pct, update_sliders=True)
 
         # masking (existing behaviour)
         epoch_moving = self._compute_epoch_motion_mask()
@@ -2753,8 +2833,8 @@ class VideoAnalysisApp(QMainWindow):
                 vals = spec_band[np.isfinite(spec_band)]
                 vmin = vmax = None
                 if vals.size > 0:
-                    low_p = (100.0 - sat_pct) / 2.0
-                    high_p = 100.0 - low_p
+                    low_p = float(self.spec_min_percentile)
+                    high_p = float(self.spec_max_percentile)
                     vmin = np.percentile(vals, low_p)
                     vmax = np.percentile(vals, high_p)
                     if vmin == vmax:
@@ -2846,6 +2926,21 @@ class VideoAnalysisApp(QMainWindow):
         # Threshold widgets (draggable lines + sliders)
         self._setup_threshold_widgets()
         self.onModeToggled()
+
+        if prev_limits is not None and len(prev_limits) == 7:
+            for ax, (xlim, ylim) in zip(self._axs[:7], prev_limits):
+                if xlim is not None:
+                    try:
+                        if len(xlim) == 2 and np.all(np.isfinite(xlim)):
+                            ax.set_xlim(xlim)
+                    except Exception:
+                        pass
+                if ylim is not None:
+                    try:
+                        if len(ylim) == 2 and np.all(np.isfinite(ylim)):
+                            ax.set_ylim(ylim)
+                    except Exception:
+                        pass
 
         self.canvas.draw()
 
