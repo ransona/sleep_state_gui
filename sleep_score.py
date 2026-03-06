@@ -69,6 +69,7 @@ STATE_LABELS = {
 
 DEFAULT_DELTA_BAND = (1.0, 4.0)
 DEFAULT_THETA_BAND = (5.0, 10.0)
+DEFAULT_LOW_FREQ_MAX_HZ = 20.0
 
 
 # ---------------------------------------------------------------------
@@ -775,6 +776,7 @@ def run_sleep_scoring(
     *,
     delta_band=None,
     theta_band=None,
+    low_freq_max_hz=DEFAULT_LOW_FREQ_MAX_HZ,
     progress_callback=None,
     simulated_npz=None,
     filename_suffix="",
@@ -792,6 +794,8 @@ def run_sleep_scoring(
         Delta band passband (Hz). Defaults to DEFAULT_DELTA_BAND.
     theta_band : tuple(float, float), optional
         Theta band passband (Hz). Defaults to DEFAULT_THETA_BAND.
+    low_freq_max_hz : float, optional
+        Upper frequency bound (Hz) used to orient the low-frequency PCA component.
     progress_callback : callable, optional
         Invoked as progress_callback(fraction, message) as the pipeline advances.
     simulated_npz : str, optional
@@ -858,6 +862,13 @@ def run_sleep_scoring(
         delta_band = DEFAULT_DELTA_BAND
     if theta_band is None:
         theta_band = DEFAULT_THETA_BAND
+    try:
+        low_freq_max_hz = float(low_freq_max_hz)
+    except Exception:
+        low_freq_max_hz = DEFAULT_LOW_FREQ_MAX_HZ
+    if not np.isfinite(low_freq_max_hz) or low_freq_max_hz <= 0:
+        low_freq_max_hz = DEFAULT_LOW_FREQ_MAX_HZ
+    low_freq_max_hz = min(low_freq_max_hz, float(np.nanmax(LOG_SPEC_FREQ_BINS)))
     delta_band = _validate_band(delta_band, "delta_band", fs)
     theta_band = _validate_band(theta_band, "theta_band", fs)
 
@@ -909,10 +920,15 @@ def run_sleep_scoring(
     freq_std = np.nanstd(log_sxx_db, axis=1, keepdims=True)
     freq_std[~np.isfinite(freq_std) | (freq_std <= 0)] = 1.0
     log_sxx_z = (log_sxx_db - freq_mean) / freq_std
-    low_freq_series, low_freq_weights = _first_principal_component(log_sxx_z)
-    low_freq_mask = LOG_SPEC_FREQ_BINS <= 20.0
-    if np.any(low_freq_mask) and np.isfinite(np.nansum(low_freq_weights[low_freq_mask])):
-        if np.nansum(low_freq_weights[low_freq_mask]) < 0:
+    low_freq_mask = LOG_SPEC_FREQ_BINS <= low_freq_max_hz
+    if np.count_nonzero(low_freq_mask) >= 2:
+        low_freq_input = log_sxx_z[low_freq_mask, :]
+        low_freq_series, low_freq_weights = _first_principal_component(low_freq_input)
+    else:
+        # Fallback for degenerate masks; keep prior behavior on full spectrum.
+        low_freq_series, low_freq_weights = _first_principal_component(log_sxx_z)
+    if np.isfinite(np.nansum(low_freq_weights)):
+        if np.nansum(low_freq_weights) < 0:
             low_freq_series = -low_freq_series
     theta_ratio_series = _band_power_ratio(
         log_sxx_resampled,
@@ -1160,6 +1176,7 @@ def run_sleep_scoring(
         },
         "delta_band": tuple(delta_band),
         "theta_band": tuple(theta_band),
+        "low_freq_max_hz": float(low_freq_max_hz),
     }
 
     step_idx += 1

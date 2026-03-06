@@ -29,6 +29,7 @@ from sleep_score import (
     build_epoch_feature_dict,
     DEFAULT_DELTA_BAND,
     DEFAULT_THETA_BAND,
+    DEFAULT_LOW_FREQ_MAX_HZ,
     DEFAULT_USER_ID,
     DEFAULT_EXP_ID,
 )
@@ -617,6 +618,7 @@ class VideoAnalysisApp(QMainWindow):
         self.available_state_values = set()
         self.delta_band = DEFAULT_DELTA_BAND
         self.theta_band = DEFAULT_THETA_BAND
+        self.low_freq_max_hz = DEFAULT_LOW_FREQ_MAX_HZ
         self.simulation_enabled = False
         self.simulated_sample_name = None
         self.simulated_sample_path = None
@@ -664,6 +666,7 @@ class VideoAnalysisApp(QMainWindow):
             "state": True,
         }
         self._line_visibility_checkboxes = {}
+        self._threshold_revert_buttons = {}
 
         # cached epoch features for reclassification
         self.emg_rms_mean_by_epoch = None
@@ -914,6 +917,12 @@ class VideoAnalysisApp(QMainWindow):
         bandLayout.addWidget(self.thetaBandLowEdit)
         bandLayout.addWidget(QLabel("to"))
         bandLayout.addWidget(self.thetaBandHighEdit)
+        bandLayout.addSpacing(20)
+        bandLayout.addWidget(QLabel("Low-freq max (Hz):"))
+        self.lowFreqMaxEdit = QLineEdit(f"{DEFAULT_LOW_FREQ_MAX_HZ:.1f}")
+        self.lowFreqMaxEdit.setFixedWidth(60)
+        self.lowFreqMaxEdit.setEnabled(False)
+        bandLayout.addWidget(self.lowFreqMaxEdit)
         controlsLayout.addLayout(bandLayout)
 
         # --- State assignment controls (buttons + shortcuts) ---
@@ -929,7 +938,7 @@ class VideoAnalysisApp(QMainWindow):
         thresholdPanelLayout.setContentsMargins(0, 0, 0, 0)
         thresholdPanelLayout.setHorizontalSpacing(8)
         thresholdPanelLayout.setVerticalSpacing(4)
-        thresholdPanelLayout.addWidget(QLabel("Thresholds"), 0, 0, 1, 4)
+        thresholdPanelLayout.addWidget(QLabel("Thresholds"), 0, 0, 1, 3)
 
         self.emgThresholdEdit = QLineEdit("")
         self.lowFreqThresholdEdit = QLineEdit("")
@@ -945,14 +954,29 @@ class VideoAnalysisApp(QMainWindow):
             edit.setEnabled(False)
             edit.editingFinished.connect(self._on_threshold_text_edit_finished)
 
+        self._threshold_revert_buttons = {
+            "emg_rms_threshold": QPushButton("Revert"),
+            "low_freq_threshold": QPushButton("Revert"),
+            "theta_delta_ratio_threshold": QPushButton("Revert"),
+            "locomotion_threshold": QPushButton("Revert"),
+        }
+        for key, btn in self._threshold_revert_buttons.items():
+            btn.setEnabled(False)
+            btn.setFixedWidth(68)
+            btn.clicked.connect(lambda _, k=key: self._revert_single_threshold(k))
+
         thresholdPanelLayout.addWidget(QLabel("EMG"), 1, 0)
         thresholdPanelLayout.addWidget(self.emgThresholdEdit, 1, 1)
-        thresholdPanelLayout.addWidget(QLabel("Low-freq"), 1, 2)
-        thresholdPanelLayout.addWidget(self.lowFreqThresholdEdit, 1, 3)
-        thresholdPanelLayout.addWidget(QLabel("Theta ratio"), 2, 0)
-        thresholdPanelLayout.addWidget(self.ratioThresholdEdit, 2, 1)
-        thresholdPanelLayout.addWidget(QLabel("Locomotion"), 2, 2)
-        thresholdPanelLayout.addWidget(self.locomotionThresholdEdit, 2, 3)
+        thresholdPanelLayout.addWidget(self._threshold_revert_buttons["emg_rms_threshold"], 1, 2)
+        thresholdPanelLayout.addWidget(QLabel("Low-freq"), 2, 0)
+        thresholdPanelLayout.addWidget(self.lowFreqThresholdEdit, 2, 1)
+        thresholdPanelLayout.addWidget(self._threshold_revert_buttons["low_freq_threshold"], 2, 2)
+        thresholdPanelLayout.addWidget(QLabel("Theta ratio"), 3, 0)
+        thresholdPanelLayout.addWidget(self.ratioThresholdEdit, 3, 1)
+        thresholdPanelLayout.addWidget(self._threshold_revert_buttons["theta_delta_ratio_threshold"], 3, 2)
+        thresholdPanelLayout.addWidget(QLabel("Locomotion"), 4, 0)
+        thresholdPanelLayout.addWidget(self.locomotionThresholdEdit, 4, 1)
+        thresholdPanelLayout.addWidget(self._threshold_revert_buttons["locomotion_threshold"], 4, 2)
         controlsLayout.addWidget(thresholdPanel)
 
         controlsLayout.addStretch(1)
@@ -1145,10 +1169,11 @@ class VideoAnalysisApp(QMainWindow):
                     bands = self._parse_band_entries()
                     if bands is None:
                         return
-                    delta_band_vals, theta_band_vals = bands
+                    delta_band_vals, theta_band_vals, low_freq_max_hz = bands
                     sleep_state = self._run_sleep_scoring_for_current_ids(
                         delta_band=delta_band_vals,
                         theta_band=theta_band_vals,
+                        low_freq_max_hz=low_freq_max_hz,
                     )
                     if sleep_state is None:
                         return
@@ -1166,10 +1191,11 @@ class VideoAnalysisApp(QMainWindow):
                 bands = self._parse_band_entries()
                 if bands is None:
                     return
-                delta_band_vals, theta_band_vals = bands
+                delta_band_vals, theta_band_vals, low_freq_max_hz = bands
                 sleep_state = self._run_sleep_scoring_for_current_ids(
                     delta_band=delta_band_vals,
                     theta_band=theta_band_vals,
+                    low_freq_max_hz=low_freq_max_hz,
                 )
                 if sleep_state is None:
                     return
@@ -1189,10 +1215,11 @@ class VideoAnalysisApp(QMainWindow):
                 bands = self._parse_band_entries()
                 if bands is None:
                     return
-                delta_band_vals, theta_band_vals = bands
+                delta_band_vals, theta_band_vals, low_freq_max_hz = bands
                 sleep_state = self._run_sleep_scoring_for_current_ids(
                     delta_band=delta_band_vals,
                     theta_band=theta_band_vals,
+                    low_freq_max_hz=low_freq_max_hz,
                 )
                 if sleep_state is None:
                     return
@@ -1242,7 +1269,7 @@ class VideoAnalysisApp(QMainWindow):
 
         return True, ""
 
-    def _run_sleep_scoring_for_current_ids(self, delta_band=None, theta_band=None):
+    def _run_sleep_scoring_for_current_ids(self, delta_band=None, theta_band=None, low_freq_max_hz=None):
         progress_dialog = ScoringProgressDialog(self)
         progress_dialog.show()
         QApplication.processEvents()
@@ -1256,6 +1283,7 @@ class VideoAnalysisApp(QMainWindow):
                 self.expID,
                 delta_band=delta_band,
                 theta_band=theta_band,
+                low_freq_max_hz=low_freq_max_hz,
                 progress_callback=_progress_cb,
                 simulated_npz=self._simulation_npz_path(),
                 filename_suffix=self._simulation_suffix(),
@@ -1362,6 +1390,7 @@ class VideoAnalysisApp(QMainWindow):
         # band metadata
         delta_band = sleep_state.get("delta_band", DEFAULT_DELTA_BAND)
         theta_band = sleep_state.get("theta_band", DEFAULT_THETA_BAND)
+        low_freq_max_hz = sleep_state.get("low_freq_max_hz", DEFAULT_LOW_FREQ_MAX_HZ)
         try:
             self.delta_band = (float(delta_band[0]), float(delta_band[1]))
         except Exception:
@@ -1370,16 +1399,24 @@ class VideoAnalysisApp(QMainWindow):
             self.theta_band = (float(theta_band[0]), float(theta_band[1]))
         except Exception:
             self.theta_band = DEFAULT_THETA_BAND
+        try:
+            self.low_freq_max_hz = float(low_freq_max_hz)
+        except Exception:
+            self.low_freq_max_hz = DEFAULT_LOW_FREQ_MAX_HZ
+        if not np.isfinite(self.low_freq_max_hz) or self.low_freq_max_hz <= 0:
+            self.low_freq_max_hz = DEFAULT_LOW_FREQ_MAX_HZ
 
         self.deltaBandLowEdit.setText(f"{self.delta_band[0]:.2f}")
         self.deltaBandHighEdit.setText(f"{self.delta_band[1]:.2f}")
         self.thetaBandLowEdit.setText(f"{self.theta_band[0]:.2f}")
         self.thetaBandHighEdit.setText(f"{self.theta_band[1]:.2f}")
+        self.lowFreqMaxEdit.setText(f"{self.low_freq_max_hz:.2f}")
         for widget in [
             self.deltaBandLowEdit,
             self.deltaBandHighEdit,
             self.thetaBandLowEdit,
             self.thetaBandHighEdit,
+            self.lowFreqMaxEdit,
         ]:
             widget.setEnabled(True)
 
@@ -1423,6 +1460,8 @@ class VideoAnalysisApp(QMainWindow):
         self.emgThresholdEdit.setEnabled(True)
         self.lowFreqThresholdEdit.setEnabled(True)
         self.ratioThresholdEdit.setEnabled(True)
+        for btn in self._threshold_revert_buttons.values():
+            btn.setEnabled(True)
         self.revertThresholdsButton.setEnabled(True)
         sat_pct = self._parse_saturation_percent()
         self.spec_range_manual = False
@@ -1462,8 +1501,9 @@ class VideoAnalysisApp(QMainWindow):
             delta_high = float(self.deltaBandHighEdit.text())
             theta_low = float(self.thetaBandLowEdit.text())
             theta_high = float(self.thetaBandHighEdit.text())
+            low_freq_max = float(self.lowFreqMaxEdit.text())
         except Exception:
-            QMessageBox.warning(self, "Band input error", "Delta/theta band values must be numeric.")
+            QMessageBox.warning(self, "Band input error", "Band values must be numeric.")
             return None
 
         if delta_low <= 0 or delta_high <= 0 or delta_high <= delta_low:
@@ -1472,10 +1512,13 @@ class VideoAnalysisApp(QMainWindow):
         if theta_low <= 0 or theta_high <= 0 or theta_high <= theta_low:
             QMessageBox.warning(self, "Band input error", "Theta band must be positive and low < high.")
             return None
+        if low_freq_max <= 0:
+            QMessageBox.warning(self, "Band input error", "Low-freq max must be > 0.")
+            return None
 
-        return (delta_low, delta_high), (theta_low, theta_high)
+        return (delta_low, delta_high), (theta_low, theta_high), float(low_freq_max)
 
-    def _bands_changed(self, delta_band, theta_band):
+    def _bands_changed(self, delta_band, theta_band, low_freq_max_hz):
         tol = 1e-6
         def diff(a, b):
             return abs(a - b) > tol
@@ -1484,14 +1527,16 @@ class VideoAnalysisApp(QMainWindow):
             or diff(delta_band[1], self.delta_band[1])
             or diff(theta_band[0], self.theta_band[0])
             or diff(theta_band[1], self.theta_band[1])
+            or diff(float(low_freq_max_hz), float(self.low_freq_max_hz))
         ):
             return True
         return False
 
-    def _run_full_rescore_with_new_bands(self, delta_band, theta_band):
+    def _run_full_rescore_with_new_bands(self, delta_band, theta_band, low_freq_max_hz):
         sleep_state = self._run_sleep_scoring_for_current_ids(
             delta_band=delta_band,
             theta_band=theta_band,
+            low_freq_max_hz=low_freq_max_hz,
         )
         if sleep_state is None:
             return
@@ -1500,7 +1545,7 @@ class VideoAnalysisApp(QMainWindow):
         QMessageBox.information(
             self,
             "Sleep scoring",
-            "Data reloaded with updated delta/theta bands.",
+            "Data reloaded with updated delta/theta bands and low-freq max.",
         )
 
     def runSleepScoringClicked(self):
@@ -1519,7 +1564,7 @@ class VideoAnalysisApp(QMainWindow):
         bands = self._parse_band_entries()
         if bands is None:
             return
-        delta_band_vals, theta_band_vals = bands
+        delta_band_vals, theta_band_vals, low_freq_max_hz = bands
 
         progress_dialog = ScoringProgressDialog(self)
         progress_dialog.show()
@@ -1532,6 +1577,7 @@ class VideoAnalysisApp(QMainWindow):
                 exp_id,
                 delta_band=delta_band_vals,
                 theta_band=theta_band_vals,
+                low_freq_max_hz=low_freq_max_hz,
                 progress_callback=progress_dialog.update_progress,
                 simulated_npz=self._simulation_npz_path(),
                 filename_suffix=self._simulation_suffix(),
@@ -2456,9 +2502,9 @@ class VideoAnalysisApp(QMainWindow):
         band_values = self._parse_band_entries()
         if band_values is None:
             return
-        delta_band_vals, theta_band_vals = band_values
-        if self._bands_changed(delta_band_vals, theta_band_vals):
-            self._run_full_rescore_with_new_bands(delta_band_vals, theta_band_vals)
+        delta_band_vals, theta_band_vals, low_freq_max_hz = band_values
+        if self._bands_changed(delta_band_vals, theta_band_vals, low_freq_max_hz):
+            self._run_full_rescore_with_new_bands(delta_band_vals, theta_band_vals, low_freq_max_hz)
         else:
             self.rerun_classification()
 
@@ -2482,6 +2528,7 @@ class VideoAnalysisApp(QMainWindow):
         sleep_state["low_freq_threshold"] = float(self.low_freq_threshold)
         sleep_state["delta_power_threshold"] = float(self.low_freq_threshold)
         sleep_state["locomotion_threshold"] = float(self.locomotion_threshold)
+        sleep_state["low_freq_max_hz"] = float(self.low_freq_max_hz)
         sleep_state["left_video_crop"] = self._coerce_crop_rect(self.left_video_crop)
         sleep_state["right_video_crop"] = self._coerce_crop_rect(self.right_video_crop)
 
@@ -2652,6 +2699,30 @@ class VideoAnalysisApp(QMainWindow):
         self._rebuild_threshold_widgets_for_current_values()
         self._sync_threshold_widgets_to_values()
         self.rerun_classification()
+
+    def _revert_single_threshold(self, threshold_key):
+        if not self.loaded:
+            return
+        if threshold_key not in self._saved_threshold_values:
+            return
+        saved_val = float(self._saved_threshold_values[threshold_key])
+        if threshold_key == "emg_rms_threshold":
+            self.emg_rms_threshold = saved_val
+        elif threshold_key == "low_freq_threshold":
+            self.low_freq_threshold = saved_val
+        elif threshold_key == "theta_delta_ratio_threshold":
+            self.theta_delta_ratio_threshold = saved_val
+        elif threshold_key == "locomotion_threshold":
+            self.locomotion_threshold = saved_val
+        else:
+            return
+
+        if self._threshold_outside_slider_ranges():
+            self._rebuild_threshold_widgets_for_current_values()
+        self._sync_threshold_widgets_to_values()
+        self._handle_threshold_change()
+        if not self._auto_rescore_enabled():
+            self.rerun_classification()
 
     def show_threshold_histogram_dialog(self):
         if not self.loaded:
