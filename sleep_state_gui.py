@@ -11,7 +11,7 @@ from PyQt5.QtWidgets import (
     QMainWindow, QApplication, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QPushButton, QLineEdit, QSlider, QMessageBox, QSizePolicy,
     QCheckBox, QRadioButton, QButtonGroup, QProgressBar, QDoubleSpinBox,
-    QInputDialog,
+    QInputDialog, QDialog, QDialogButtonBox,
 )
 from PyQt5.QtCore import Qt, QTimer
 
@@ -249,6 +249,100 @@ class DraggableVLine:
 
     def _on_release(self, event):
         self._dragging = False
+
+
+class VideoDisplayLabel(QLabel):
+    def __init__(self, eye_key, on_double_click=None, parent=None):
+        super().__init__(parent)
+        self.eye_key = eye_key
+        self.on_double_click = on_double_click
+
+    def mouseDoubleClickEvent(self, event):
+        if event.button() == Qt.LeftButton and callable(self.on_double_click):
+            self.on_double_click(self.eye_key)
+            event.accept()
+            return
+        super().mouseDoubleClickEvent(event)
+
+
+class CropSelectLabel(QLabel):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setAlignment(Qt.AlignLeft | Qt.AlignTop)
+        self._origin = None
+        self._rubber_band = QtWidgets.QRubberBand(QtWidgets.QRubberBand.Rectangle, self)
+        self._selection = QtCore.QRect()
+
+    def mousePressEvent(self, event):
+        if event.button() != Qt.LeftButton:
+            return super().mousePressEvent(event)
+        self._origin = event.pos()
+        self._selection = QtCore.QRect(self._origin, QtCore.QSize())
+        self._rubber_band.setGeometry(self._selection)
+        self._rubber_band.show()
+        event.accept()
+
+    def mouseMoveEvent(self, event):
+        if self._origin is None:
+            return super().mouseMoveEvent(event)
+        self._selection = QtCore.QRect(self._origin, event.pos()).normalized()
+        self._rubber_band.setGeometry(self._selection)
+        event.accept()
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.LeftButton and self._origin is not None:
+            self._selection = QtCore.QRect(self._origin, event.pos()).normalized()
+            self._rubber_band.setGeometry(self._selection)
+            self._origin = None
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
+
+    def selected_rect(self):
+        return self._selection.normalized()
+
+
+class VideoCropDialog(QDialog):
+    def __init__(self, frame_rgb, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Select Eye Zoom Region")
+        self._selected_rect = None
+
+        h, w, _ = frame_rgb.shape
+        qimg = QtGui.QImage(frame_rgb.data, w, h, frame_rgb.strides[0], QtGui.QImage.Format_RGB888)
+        pixmap = QtGui.QPixmap.fromImage(qimg.copy())
+
+        layout = QVBoxLayout(self)
+        self.image_label = CropSelectLabel(self)
+        self.image_label.setPixmap(pixmap)
+        self.image_label.setFixedSize(pixmap.size())
+        layout.addWidget(self.image_label)
+
+        hint = QLabel("Drag a rectangle, then press OK.")
+        layout.addWidget(hint)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self._on_accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def _on_accept(self):
+        rect = self.image_label.selected_rect()
+        if rect.width() < 2 or rect.height() < 2:
+            QMessageBox.warning(self, "Selection required", "Select a non-empty zoom region.")
+            return
+        self._selected_rect = rect
+        self.accept()
+
+    def selected_rect(self):
+        if self._selected_rect is None:
+            return None
+        return (
+            int(self._selected_rect.x()),
+            int(self._selected_rect.y()),
+            int(self._selected_rect.width()),
+            int(self._selected_rect.height()),
+        )
 
 
 class ScoringProgressDialog(QtWidgets.QDialog):
@@ -497,6 +591,8 @@ class VideoAnalysisApp(QMainWindow):
         self.face_motion_10hz_t = None
         self.show_eye_videos = True
         self.show_pupil_overlay = True
+        self.left_video_crop = None
+        self.right_video_crop = None
 
         # cached epoch features for rescoring
         self.epoch_features_data = None
@@ -544,6 +640,18 @@ class VideoAnalysisApp(QMainWindow):
         self.spec_range_manual = False
         self.spec_min_percentile = 5.0
         self.spec_max_percentile = 95.0
+        self.line_visibility = {
+            "pupil_left": True,
+            "pupil_right": True,
+            "emg": True,
+            "wheel": True,
+            "motion": True,
+            "eeg": True,
+            "low_freq": True,
+            "ratio": True,
+            "state": True,
+        }
+        self._line_visibility_checkboxes = {}
 
         # cached epoch features for reclassification
         self.emg_rms_mean_by_epoch = None
@@ -636,10 +744,14 @@ class VideoAnalysisApp(QMainWindow):
 
         # --- Video display (two videos on one row) ---
         videoLayout = QHBoxLayout()
-        self.leftVideoLabel = QLabel("Left Eye Video")
+        self.leftVideoLabel = VideoDisplayLabel("left", on_double_click=self.onVideoLabelDoubleClicked)
+        self.leftVideoLabel.setText("Left Eye Video")
         self.leftVideoLabel.setFixedSize(240, 120)
-        self.rightVideoLabel = QLabel("Right Eye Video")
+        self.leftVideoLabel.setToolTip("Double-click to set/clear zoom crop")
+        self.rightVideoLabel = VideoDisplayLabel("right", on_double_click=self.onVideoLabelDoubleClicked)
+        self.rightVideoLabel.setText("Right Eye Video")
         self.rightVideoLabel.setFixedSize(240, 120)
+        self.rightVideoLabel.setToolTip("Double-click to set/clear zoom crop")
         videoLayout.addWidget(self.leftVideoLabel)
         videoLayout.addWidget(self.rightVideoLabel)
         controlsLayout.addLayout(videoLayout)
@@ -679,6 +791,25 @@ class VideoAnalysisApp(QMainWindow):
         self.satPercentEdit.editingFinished.connect(self._on_sat_percent_changed)
         satRow.addWidget(self.satPercentEdit)
         controlsLayout.addLayout(satRow)
+
+        lineVisRow1 = QHBoxLayout()
+        lineVisRow1.addWidget(QLabel("Show lines:"))
+        for key, label in [("pupil_left", "Left pupil"), ("pupil_right", "Right pupil"), ("emg", "EMG"), ("wheel", "Wheel"), ("motion", "Motion")]:
+            cb = QCheckBox(label)
+            cb.setChecked(True)
+            cb.toggled.connect(lambda checked, k=key: self._on_line_visibility_toggled(k, checked))
+            self._line_visibility_checkboxes[key] = cb
+            lineVisRow1.addWidget(cb)
+        controlsLayout.addLayout(lineVisRow1)
+
+        lineVisRow2 = QHBoxLayout()
+        for key, label in [("eeg", "EEG"), ("low_freq", "Low-freq"), ("ratio", "Ratio"), ("state", "State")]:
+            cb = QCheckBox(label)
+            cb.setChecked(True)
+            cb.toggled.connect(lambda checked, k=key: self._on_line_visibility_toggled(k, checked))
+            self._line_visibility_checkboxes[key] = cb
+            lineVisRow2.addWidget(cb)
+        controlsLayout.addLayout(lineVisRow2)
 
         specRangeRow = QHBoxLayout()
         self.specMinLabel = QLabel("Spec min pct: 5.0")
@@ -886,6 +1017,8 @@ class VideoAnalysisApp(QMainWindow):
     # -----------------------------
     def loadData(self):
         self._close_eye_video_caps()
+        self.left_video_crop = None
+        self.right_video_crop = None
         self.userID = self.userIdEdit.text().strip()
         self.expID = self.expIdEdit.text().strip()
         if not self.userID or not self.expID:
@@ -1154,6 +1287,8 @@ class VideoAnalysisApp(QMainWindow):
         self.locomotion_threshold = float(sleep_state.get("locomotion_threshold", 0.1))
         if not np.isfinite(self.locomotion_threshold):
             self.locomotion_threshold = 0.1
+        self.left_video_crop = self._coerce_crop_rect(sleep_state.get("left_video_crop"))
+        self.right_video_crop = self._coerce_crop_rect(sleep_state.get("right_video_crop"))
 
         stored_features = sleep_state.get("epoch_features")
         self.epoch_features_data = None
@@ -1408,7 +1543,7 @@ class VideoAnalysisApp(QMainWindow):
         frame = cv2.circle(frame, center, radius, color, 2)
         return frame
 
-    def playVideoFrame(self, frame_position, cap, eyedat):
+    def playVideoFrame(self, frame_position, cap, eyedat, crop_rect=None):
         if cap is None or not cap.isOpened():
             return None
         cap.set(cv2.CAP_PROP_POS_FRAMES, int(frame_position))
@@ -1426,6 +1561,10 @@ class VideoAnalysisApp(QMainWindow):
             frame = (frame - min_val) / (max_val - min_val) * 255
         frame = np.stack((frame,) * 3, axis=-1).astype(np.uint8)
         frame = self.overlay_plot(frame, int(frame_position), eyedat)
+        sanitized_crop = self._sanitize_crop_rect(crop_rect, frame.shape)
+        if sanitized_crop is not None:
+            x, y, w, h = sanitized_crop
+            frame = frame[y:y + h, x:x + w]
         return frame
 
     def onShowVideosToggled(self, checked):
@@ -1453,6 +1592,101 @@ class VideoAnalysisApp(QMainWindow):
             self.motion_smoothing_secs = 0.5
         if self.loaded:
             self.plotTraces()
+
+    def _is_line_visible(self, key):
+        return bool(self.line_visibility.get(key, True))
+
+    def _on_line_visibility_toggled(self, key, checked):
+        self.line_visibility[key] = bool(checked)
+        if self.loaded:
+            self.plotTraces()
+
+    def _sanitize_crop_rect(self, crop_rect, frame_shape):
+        if crop_rect is None:
+            return None
+        try:
+            x, y, w, h = crop_rect
+            x = int(x)
+            y = int(y)
+            w = int(w)
+            h = int(h)
+        except Exception:
+            return None
+        if w <= 1 or h <= 1:
+            return None
+        frame_h, frame_w = int(frame_shape[0]), int(frame_shape[1])
+        x0 = max(0, min(x, frame_w - 1))
+        y0 = max(0, min(y, frame_h - 1))
+        x1 = max(x0 + 1, min(x0 + w, frame_w))
+        y1 = max(y0 + 1, min(y0 + h, frame_h))
+        if x1 <= x0 or y1 <= y0:
+            return None
+        return x0, y0, x1 - x0, y1 - y0
+
+    @staticmethod
+    def _coerce_crop_rect(crop_rect):
+        if crop_rect is None:
+            return None
+        try:
+            x, y, w, h = crop_rect
+            x = int(x)
+            y = int(y)
+            w = int(w)
+            h = int(h)
+        except Exception:
+            return None
+        if w <= 1 or h <= 1:
+            return None
+        return (x, y, w, h)
+
+    def onVideoLabelDoubleClicked(self, eye_key):
+        if not self.loaded:
+            return
+        if eye_key not in ("left", "right"):
+            return
+
+        current_crop = self.left_video_crop if eye_key == "left" else self.right_video_crop
+        if current_crop is not None:
+            if eye_key == "left":
+                self.left_video_crop = None
+            else:
+                self.right_video_crop = None
+            self._state_dirty = True
+            self._update_save_button_state()
+            self.updateFrame()
+            return
+
+        t = self._current_time()
+        if self.eye_frame_times is not None and self.eye_frame_times.size > 0:
+            idx_frame = int(np.argmin(np.abs(self.eye_frame_times - t)))
+        else:
+            idx_frame = 0
+
+        if eye_key == "left":
+            sample_frame = self.playVideoFrame(idx_frame, self.left_video_cap, self.left_eyedat, crop_rect=None)
+        else:
+            sample_frame = self.playVideoFrame(idx_frame, self.right_video_cap, self.right_eyedat, crop_rect=None)
+
+        if sample_frame is None:
+            QMessageBox.warning(self, "Video crop", "Could not read a frame for crop selection.")
+            return
+
+        dialog = VideoCropDialog(sample_frame, self)
+        if dialog.exec_() != QDialog.Accepted:
+            return
+        selected = dialog.selected_rect()
+        selected = self._sanitize_crop_rect(selected, sample_frame.shape)
+        if selected is None:
+            QMessageBox.warning(self, "Video crop", "Invalid crop selection.")
+            return
+
+        if eye_key == "left":
+            self.left_video_crop = selected
+        else:
+            self.right_video_crop = selected
+        self._state_dirty = True
+        self._update_save_button_state()
+        self.updateFrame()
 
     def _parse_saturation_percent(self):
         try:
@@ -1550,12 +1784,17 @@ class VideoAnalysisApp(QMainWindow):
                 idx_frame,
                 self.left_video_cap,
                 self.left_eyedat,
+                crop_rect=self.left_video_crop,
             )
             if frame_left is not None:
+                frame_left_c = np.ascontiguousarray(frame_left)
                 image_left = QtGui.QImage(
-                    frame_left.data, frame_left.shape[1], frame_left.shape[0],
-                    frame_left.strides[0], QtGui.QImage.Format_RGB888
-                )
+                    frame_left_c.data,
+                    frame_left_c.shape[1],
+                    frame_left_c.shape[0],
+                    frame_left_c.strides[0],
+                    QtGui.QImage.Format_RGB888,
+                ).copy()
                 pixmap_left = QtGui.QPixmap.fromImage(image_left)
                 self.leftVideoLabel.setPixmap(pixmap_left.scaled(self.leftVideoLabel.size(), Qt.KeepAspectRatio))
 
@@ -1563,12 +1802,17 @@ class VideoAnalysisApp(QMainWindow):
                 idx_frame,
                 self.right_video_cap,
                 self.right_eyedat,
+                crop_rect=self.right_video_crop,
             )
             if frame_right is not None:
+                frame_right_c = np.ascontiguousarray(frame_right)
                 image_right = QtGui.QImage(
-                    frame_right.data, frame_right.shape[1], frame_right.shape[0],
-                    frame_right.strides[0], QtGui.QImage.Format_RGB888
-                )
+                    frame_right_c.data,
+                    frame_right_c.shape[1],
+                    frame_right_c.shape[0],
+                    frame_right_c.strides[0],
+                    QtGui.QImage.Format_RGB888,
+                ).copy()
                 pixmap_right = QtGui.QPixmap.fromImage(image_right)
                 self.rightVideoLabel.setPixmap(pixmap_right.scaled(self.rightVideoLabel.size(), Qt.KeepAspectRatio))
 
@@ -2186,6 +2430,8 @@ class VideoAnalysisApp(QMainWindow):
         sleep_state["low_freq_threshold"] = float(self.low_freq_threshold)
         sleep_state["delta_power_threshold"] = float(self.low_freq_threshold)
         sleep_state["locomotion_threshold"] = float(self.locomotion_threshold)
+        sleep_state["left_video_crop"] = self._coerce_crop_rect(self.left_video_crop)
+        sleep_state["right_video_crop"] = self._coerce_crop_rect(self.right_video_crop)
 
         if self.epoch_features_data is not None:
             sleep_state["epoch_features"] = {
@@ -2701,9 +2947,9 @@ class VideoAnalysisApp(QMainWindow):
 
         # Preserve current zoom/pan limits when redrawing the figure.
         prev_limits = None
-        if isinstance(self._axs, np.ndarray) and self._axs.size >= 7:
+        if isinstance(self._axs, np.ndarray) and self._axs.size >= 8:
             prev_limits = []
-            for ax in self._axs[:7]:
+            for ax in self._axs[:8]:
                 try:
                     prev_limits.append((ax.get_xlim(), ax.get_ylim()))
                 except Exception:
@@ -2727,8 +2973,8 @@ class VideoAnalysisApp(QMainWindow):
         self.figure.clear()
 
         axs = self.figure.subplots(
-            7, 1, sharex=True,
-            gridspec_kw={'height_ratios': [1, 1, 1, 3, 1, 1, 1]}
+            8, 1, sharex=True,
+            gridspec_kw={'height_ratios': [1, 1, 1, 1, 3, 1, 1, 1]}
         )
         self._axs = axs
 
@@ -2736,9 +2982,50 @@ class VideoAnalysisApp(QMainWindow):
         emg_color = 'tab:blue'
         wheel_color = 'tab:orange'
 
-        # 1) EMG RMS
-        ax1 = axs[0]
-        ax1.plot(self.emg_rms_10hz_t, self.emg_rms_10hz, color=emg_color, label="EMG RMS")
+        # 1) Pupil diameter
+        ax0 = axs[0]
+        eye_t = np.asarray(self.eye_frame_times, dtype=float) if self.eye_frame_times is not None else np.array([], dtype=float)
+        if eye_t.size > 0:
+            if self._is_line_visible("pupil_left"):
+                try:
+                    left_r = np.asarray(self.left_eyedat.get("radius", []), dtype=float)
+                    n = min(eye_t.size, left_r.size)
+                    if n > 0:
+                        left_d = 2.0 * left_r[:n]
+                        finite_left = left_d[np.isfinite(left_d)]
+                        if finite_left.size > 0:
+                            left_cap = float(np.percentile(finite_left, 80.0))
+                            left_d = np.minimum(left_d, left_cap)
+                        ax0.plot(eye_t[:n], left_d, color="tab:red", linewidth=1.0, label="Left pupil")
+                except Exception:
+                    pass
+            if self._is_line_visible("pupil_right"):
+                try:
+                    right_r = np.asarray(self.right_eyedat.get("radius", []), dtype=float)
+                    n = min(eye_t.size, right_r.size)
+                    if n > 0:
+                        right_d = 2.0 * right_r[:n]
+                        finite_right = right_d[np.isfinite(right_d)]
+                        if finite_right.size > 0:
+                            right_cap = float(np.percentile(finite_right, 80.0))
+                            right_d = np.minimum(right_d, right_cap)
+                        ax0.plot(eye_t[:n], right_d, color="tab:purple", linewidth=1.0, label="Right pupil")
+                except Exception:
+                    pass
+        ax0.set_ylabel("Pupil\ndiam")
+        ax0.spines['top'].set_visible(False)
+        ax0.spines['right'].set_visible(False)
+        ax0.tick_params(axis='x', labelbottom=False)
+        if self._is_line_visible("pupil_left") or self._is_line_visible("pupil_right"):
+            try:
+                ax0.legend(loc="upper right", fontsize=7, frameon=False)
+            except Exception:
+                pass
+
+        # 2) EMG RMS
+        ax1 = axs[1]
+        if self._is_line_visible("emg"):
+            ax1.plot(self.emg_rms_10hz_t, self.emg_rms_10hz, color=emg_color, label="EMG RMS")
         ax1.set_ylabel("EMG\nRMS", color=emg_color)
         ax1.spines['top'].set_visible(False)
         ax1.spines['right'].set_visible(False)
@@ -2746,9 +3033,10 @@ class VideoAnalysisApp(QMainWindow):
         ax1.tick_params(axis='x', labelbottom=False)
         ax1.spines['left'].set_color(emg_color)
 
-        # 2) Wheel
-        ax2 = axs[1]
-        ax2.plot(self.wheel_10hz_t, self.wheel_10hz, color=wheel_color, label="Wheel")
+        # 3) Wheel
+        ax2 = axs[2]
+        if self._is_line_visible("wheel"):
+            ax2.plot(self.wheel_10hz_t, self.wheel_10hz, color=wheel_color, label="Wheel")
         ax2.set_ylabel("Wheel", color=wheel_color)
         ax2.spines['top'].set_visible(False)
         ax2.spines['right'].set_visible(False)
@@ -2779,14 +3067,15 @@ class VideoAnalysisApp(QMainWindow):
             if window_samples > 1:
                 motion_signal = self._smooth_signal(motion_signal, window_samples)
             motion_vals = self._zscore_safe(motion_signal)
-            motion_ax.plot(
-                self.face_motion_10hz_t,
-                motion_vals,
-                color="0.4",
-                linewidth=1.0,
-                label="Motion",
-                zorder=4,
-            )
+            if self._is_line_visible("motion"):
+                motion_ax.plot(
+                    self.face_motion_10hz_t,
+                    motion_vals,
+                    color="0.4",
+                    linewidth=1.0,
+                    label="Motion",
+                    zorder=4,
+                )
             motion_ax.set_ylabel("Motion", color="0.4")
             motion_ax.tick_params(axis='y', labelcolor="0.4")
             motion_ax.spines['top'].set_visible(False)
@@ -2795,7 +3084,8 @@ class VideoAnalysisApp(QMainWindow):
             if finite_motion.size > 0:
                 max_abs_motion = max(np.max(np.abs(finite_motion)), 1e-6)
                 motion_ax.set_ylim(-max_abs_motion, max_abs_motion)
-            motion_ax.axhline(0, color="0.6", linestyle="--", linewidth=0.8)
+            if self._is_line_visible("motion"):
+                motion_ax.axhline(0, color="0.6", linestyle="--", linewidth=0.8)
             try:
                 motion_ax.set_zorder(1)
                 ax2.set_zorder(2)
@@ -2804,16 +3094,17 @@ class VideoAnalysisApp(QMainWindow):
             except Exception:
                 pass
 
-        # 3) EEG 10 Hz
-        ax3 = axs[2]
-        ax3.plot(self.eeg_10hz_t, self.eeg_10hz)
+        # 4) EEG 10 Hz
+        ax3 = axs[3]
+        if self._is_line_visible("eeg"):
+            ax3.plot(self.eeg_10hz_t, self.eeg_10hz)
         ax3.set_ylabel("EEG")
         ax3.spines['top'].set_visible(False)
         ax3.spines['right'].set_visible(False)
         ax3.tick_params(axis='x', labelbottom=False)
 
-        # 4) EEG spectrogram, 0–20 Hz, saturation, pixelated
-        ax4 = axs[3]
+        # 5) EEG spectrogram, 0–20 Hz, saturation, pixelated
+        ax4 = axs[4]
         max_freq = 20.0
         if (
             self.eeg_spectrogram.size > 0 and
@@ -2869,8 +3160,8 @@ class VideoAnalysisApp(QMainWindow):
         ax4.spines['right'].set_visible(False)
         ax4.tick_params(axis='x', labelbottom=False)
 
-        # 5) Low-frequency power
-        ax5 = axs[4]
+        # 6) Low-frequency power
+        ax5 = axs[5]
         low_freq_source = (
             self.low_freq_power_smoothed
             if isinstance(self.low_freq_power_smoothed, np.ndarray) and self.low_freq_power_smoothed.size > 0
@@ -2882,21 +3173,23 @@ class VideoAnalysisApp(QMainWindow):
             lf_masked[epoch_moving] = np.nan
         else:
             lf_masked = np.full_like(self.epoch_t, np.nan, dtype=float)
-        ax5.plot(self.epoch_t, lf_masked, color='tab:orange', label="Low-freq power")
+        if self._is_line_visible("low_freq"):
+            ax5.plot(self.epoch_t, lf_masked, color='tab:orange', label="Low-freq power")
         ax5.set_ylabel("Low freq\npower")
         ax5.spines['top'].set_visible(False)
         ax5.spines['right'].set_visible(False)
         ax5.tick_params(axis='x', labelbottom=False)
-        # 6) Ratio plot
-        ax6 = axs[5]
-        ax6.plot(self.epoch_t, ratio_masked, color='tab:green')
+        # 7) Ratio plot
+        ax6 = axs[6]
+        if self._is_line_visible("ratio"):
+            ax6.plot(self.epoch_t, ratio_masked, color='tab:green')
         ax6.set_ylabel("θ/δ")
         ax6.spines['top'].set_visible(False)
         ax6.spines['right'].set_visible(False)
         ax6.tick_params(axis='x', labelbottom=False)
 
-        # 7) State axis (epoch-level)
-        ax7 = axs[6]
+        # 8) State axis (epoch-level)
+        ax7 = axs[7]
         ax7.set_ylabel("State")
         ax7.set_xlabel("Time (s)")
         ax7.spines['top'].set_visible(False)
@@ -2927,8 +3220,8 @@ class VideoAnalysisApp(QMainWindow):
         self._setup_threshold_widgets()
         self.onModeToggled()
 
-        if prev_limits is not None and len(prev_limits) == 7:
-            for ax, (xlim, ylim) in zip(self._axs[:7], prev_limits):
+        if prev_limits is not None and len(prev_limits) == 8:
+            for ax, (xlim, ylim) in zip(self._axs[:8], prev_limits):
                 if xlim is not None:
                     try:
                         if len(xlim) == 2 and np.all(np.isfinite(xlim)):
@@ -2964,10 +3257,11 @@ class VideoAnalysisApp(QMainWindow):
 
         color_map = {0: 'k', 1: '0.5', 2: 'tab:blue', 3: 'tab:green'}
 
-        for state_val, col in color_map.items():
-            mask = (s == state_val)
-            y = np.where(mask, s, np.nan)
-            ax6.step(t, y, where="post", color=col, linewidth=1.5)
+        if self._is_line_visible("state"):
+            for state_val, col in color_map.items():
+                mask = (s == state_val)
+                y = np.where(mask, s, np.nan)
+                ax6.step(t, y, where="post", color=col, linewidth=1.5)
 
         if self.state_label_map is not None:
             try:
