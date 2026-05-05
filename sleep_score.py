@@ -70,6 +70,8 @@ STATE_LABELS = {
 DEFAULT_DELTA_BAND = (1.0, 4.0)
 DEFAULT_THETA_BAND = (5.0, 10.0)
 DEFAULT_LOW_FREQ_MAX_HZ = 20.0
+DEFAULT_LOCOMOTION_THRESHOLD = 0.05
+DEFAULT_MIN_SLEEP_STATE_SEC = 20.0
 
 
 # ---------------------------------------------------------------------
@@ -533,12 +535,13 @@ def build_epoch_feature_dict(
     }
 
 
-def estimate_thresholds_from_epoch_features(epoch_features: Dict) -> Dict[str, float]:
+def estimate_thresholds_from_epoch_features(
+    epoch_features: Dict,
+    default_locomotion_threshold: float = DEFAULT_LOCOMOTION_THRESHOLD,
+) -> Dict[str, float]:
     """
     Estimate thresholds using trough detection on the available epoch metrics.
     """
-
-    default_locomotion_thr = 0.1
 
     def _resolve(arr):
         arr_vals = _as_float_array(arr)
@@ -556,14 +559,91 @@ def estimate_thresholds_from_epoch_features(epoch_features: Dict) -> Dict[str, f
         "low_freq_threshold": _resolve(low_freq),
         "theta_ratio_threshold": _resolve(theta_ratio),
         "emg_rms_threshold": _resolve(emg_vals),
-        "locomotion_threshold": default_locomotion_thr,
+        "locomotion_threshold": float(default_locomotion_threshold),
     }
+
+
+def _find_prior_awake_state(states, start_idx, default_state=STATE_QUIET_WAKE):
+    for idx in range(int(start_idx), -1, -1):
+        state = int(states[idx])
+        if state in (STATE_ACTIVE_WAKE, STATE_QUIET_WAKE):
+            return state
+    return int(default_state)
+
+
+def _find_prior_state(states, start_idx, allowed_states, default_state):
+    allowed = set(int(s) for s in allowed_states)
+    for idx in range(int(start_idx), -1, -1):
+        state = int(states[idx])
+        if state in allowed:
+            return state
+    return int(default_state)
+
+
+def _apply_sleep_state_constraints(
+    state_epoch,
+    *,
+    min_sleep_state_sec=DEFAULT_MIN_SLEEP_STATE_SEC,
+    epoch_len_sec=EPOCH_LEN_SEC,
+    rem_only_from_nrem=True,
+):
+    states = np.asarray(state_epoch, dtype=np.int8).copy()
+    n = states.size
+    if n == 0:
+        return states
+
+    if rem_only_from_nrem:
+        i = 0
+        while i < n:
+            j = i + 1
+            while j < n and states[j] == states[i]:
+                j += 1
+            if states[i] == STATE_REM:
+                prev_state = int(states[i - 1]) if i > 0 else None
+                if prev_state != STATE_NREM:
+                    replacement = _find_prior_awake_state(states, i - 1)
+                    states[i:j] = replacement
+            i = j
+
+    try:
+        min_sleep_state_sec = float(min_sleep_state_sec)
+    except Exception:
+        min_sleep_state_sec = DEFAULT_MIN_SLEEP_STATE_SEC
+    if not np.isfinite(min_sleep_state_sec):
+        min_sleep_state_sec = DEFAULT_MIN_SLEEP_STATE_SEC
+
+    min_sleep_epochs = 1
+    if min_sleep_state_sec > 0 and epoch_len_sec > 0:
+        min_sleep_epochs = max(1, int(np.ceil(min_sleep_state_sec / float(epoch_len_sec))))
+
+    i = 0
+    while i < n:
+        j = i + 1
+        while j < n and states[j] == states[i]:
+            j += 1
+        if states[i] in (STATE_NREM, STATE_REM) and (j - i) < min_sleep_epochs:
+            if states[i] == STATE_REM:
+                replacement = _find_prior_state(
+                    states,
+                    i - 1,
+                    allowed_states=(STATE_NREM, STATE_ACTIVE_WAKE, STATE_QUIET_WAKE),
+                    default_state=STATE_QUIET_WAKE,
+                )
+            else:
+                replacement = _find_prior_awake_state(states, i - 1)
+            states[i:j] = replacement
+        i = j
+
+    return states
 
 
 def score_from_epoch_features(
     epoch_features: Dict,
     thresholds: Optional[Dict[str, float]] = None,
     auto_thresholds: bool = False,
+    default_locomotion_threshold: float = DEFAULT_LOCOMOTION_THRESHOLD,
+    min_sleep_state_sec: float = DEFAULT_MIN_SLEEP_STATE_SEC,
+    rem_only_from_nrem: bool = True,
 ) -> Tuple[np.ndarray, Dict[str, float]]:
     """
     Classify sleep states given epoch-level summary data.
@@ -604,7 +684,10 @@ def score_from_epoch_features(
         return normalized
 
     normalized_thresholds = _normalize_thresholds(thresholds)
-    auto_vals = estimate_thresholds_from_epoch_features(epoch_features)
+    auto_vals = estimate_thresholds_from_epoch_features(
+        epoch_features,
+        default_locomotion_threshold=default_locomotion_threshold,
+    )
 
     if auto_thresholds or thresholds is None:
         resolved = auto_vals
@@ -636,9 +719,9 @@ def score_from_epoch_features(
     emg_thr = resolved.get("emg_rms_threshold", float(np.nan))
     ratio_thr = resolved.get("theta_ratio_threshold", float(np.nan))
     low_freq_thr = resolved.get("low_freq_threshold", float(np.nan))
-    locomotion_thr = resolved.get("locomotion_threshold", 0.1)
+    locomotion_thr = resolved.get("locomotion_threshold", DEFAULT_LOCOMOTION_THRESHOLD)
     if not np.isfinite(locomotion_thr):
-        locomotion_thr = 0.1
+        locomotion_thr = DEFAULT_LOCOMOTION_THRESHOLD
 
     out = np.empty(n, dtype=np.int8)
     for i in range(n):
@@ -677,6 +760,13 @@ def score_from_epoch_features(
             out[i] = STATE_ACTIVE_WAKE
         else:
             out[i] = STATE_QUIET_WAKE
+
+    out = _apply_sleep_state_constraints(
+        out,
+        min_sleep_state_sec=min_sleep_state_sec,
+        epoch_len_sec=EPOCH_LEN_SEC,
+        rem_only_from_nrem=rem_only_from_nrem,
+    )
 
     return out.astype(np.int8), resolved
 
@@ -777,6 +867,9 @@ def run_sleep_scoring(
     delta_band=None,
     theta_band=None,
     low_freq_max_hz=DEFAULT_LOW_FREQ_MAX_HZ,
+    locomotion_threshold=DEFAULT_LOCOMOTION_THRESHOLD,
+    min_sleep_state_sec=DEFAULT_MIN_SLEEP_STATE_SEC,
+    rem_only_from_nrem=True,
     progress_callback=None,
     simulated_npz=None,
     filename_suffix="",
@@ -796,6 +889,12 @@ def run_sleep_scoring(
         Theta band passband (Hz). Defaults to DEFAULT_THETA_BAND.
     low_freq_max_hz : float, optional
         Upper frequency bound (Hz) used to orient the low-frequency PCA component.
+    locomotion_threshold : float, optional
+        Wheel-speed threshold above which epochs are forced to active wake.
+    min_sleep_state_sec : float, optional
+        Minimum contiguous duration required to keep NREM/REM bouts.
+    rem_only_from_nrem : bool, optional
+        When True, direct wake-to-REM transitions are disallowed.
     progress_callback : callable, optional
         Invoked as progress_callback(fraction, message) as the pipeline advances.
     simulated_npz : str, optional
@@ -1057,12 +1156,15 @@ def run_sleep_scoring(
     sleep_state_epoch, thresholds_used = score_from_epoch_features(
         epoch_features,
         auto_thresholds=True,
+        default_locomotion_threshold=locomotion_threshold,
+        min_sleep_state_sec=min_sleep_state_sec,
+        rem_only_from_nrem=rem_only_from_nrem,
     )
 
     emg_threshold = thresholds_used["emg_rms_threshold"]
     theta_ratio_thr = thresholds_used["theta_ratio_threshold"]
     low_freq_thr = thresholds_used["low_freq_threshold"]
-    locomotion_thr = thresholds_used.get("locomotion_threshold", 0.1)
+    locomotion_thr = thresholds_used.get("locomotion_threshold", DEFAULT_LOCOMOTION_THRESHOLD)
 
     print(f"  - emg_threshold: {emg_threshold:.4f}")
     print(f"  - theta_ratio_thr: {theta_ratio_thr:.4f}")
@@ -1168,6 +1270,8 @@ def run_sleep_scoring(
         "low_freq_threshold": float(low_freq_thr),
         "delta_power_threshold": float(low_freq_thr),
         "locomotion_threshold": float(locomotion_thr),
+        "min_sleep_state_sec": float(min_sleep_state_sec),
+        "rem_only_from_nrem": bool(rem_only_from_nrem),
 
         # cached epoch features for downstream rescoring
         "epoch_features": {

@@ -30,6 +30,8 @@ from sleep_score import (
     DEFAULT_DELTA_BAND,
     DEFAULT_THETA_BAND,
     DEFAULT_LOW_FREQ_MAX_HZ,
+    DEFAULT_LOCOMOTION_THRESHOLD,
+    DEFAULT_MIN_SLEEP_STATE_SEC,
     DEFAULT_USER_ID,
     DEFAULT_EXP_ID,
 )
@@ -594,7 +596,9 @@ class VideoAnalysisApp(QMainWindow):
         self.low_freq_threshold = None
         self.theta_delta_ratio_threshold = None
         self.delta_power_threshold = None
-        self.locomotion_threshold = 0.1
+        self.locomotion_threshold = DEFAULT_LOCOMOTION_THRESHOLD
+        self.min_sleep_state_sec = DEFAULT_MIN_SLEEP_STATE_SEC
+        self.rem_only_from_nrem = True
         self._saved_threshold_values = {}
 
         # eye frame times
@@ -925,6 +929,19 @@ class VideoAnalysisApp(QMainWindow):
         bandLayout.addWidget(self.lowFreqMaxEdit)
         controlsLayout.addLayout(bandLayout)
 
+        rulesLayout = QHBoxLayout()
+        rulesLayout.addWidget(QLabel("Min sleep (s):"))
+        self.minSleepStateEdit = QLineEdit(f"{DEFAULT_MIN_SLEEP_STATE_SEC:.1f}")
+        self.minSleepStateEdit.setFixedWidth(60)
+        self.minSleepStateEdit.editingFinished.connect(self._on_classification_rule_changed)
+        rulesLayout.addWidget(self.minSleepStateEdit)
+        self.remOnlyFromNremCheck = QCheckBox("Only allow NREM -> REM")
+        self.remOnlyFromNremCheck.setChecked(True)
+        self.remOnlyFromNremCheck.toggled.connect(self._on_classification_rule_changed)
+        rulesLayout.addWidget(self.remOnlyFromNremCheck)
+        rulesLayout.addStretch(1)
+        controlsLayout.addLayout(rulesLayout)
+
         # --- State assignment controls (buttons + shortcuts) ---
         stateAssignLayout = QHBoxLayout()
         stateAssignLayout.addWidget(QLabel("Assign state:"))
@@ -943,7 +960,7 @@ class VideoAnalysisApp(QMainWindow):
         self.emgThresholdEdit = QLineEdit("")
         self.lowFreqThresholdEdit = QLineEdit("")
         self.ratioThresholdEdit = QLineEdit("")
-        self.locomotionThresholdEdit = QLineEdit("")
+        self.locomotionThresholdEdit = QLineEdit(f"{DEFAULT_LOCOMOTION_THRESHOLD:.4g}")
         for edit in [
             self.emgThresholdEdit,
             self.lowFreqThresholdEdit,
@@ -953,6 +970,7 @@ class VideoAnalysisApp(QMainWindow):
             edit.setFixedWidth(90)
             edit.setEnabled(False)
             edit.editingFinished.connect(self._on_threshold_text_edit_finished)
+        self.locomotionThresholdEdit.setEnabled(True)
 
         self._threshold_revert_buttons = {
             "emg_rms_threshold": QPushButton("Revert"),
@@ -1269,10 +1287,32 @@ class VideoAnalysisApp(QMainWindow):
 
         return True, ""
 
-    def _run_sleep_scoring_for_current_ids(self, delta_band=None, theta_band=None, low_freq_max_hz=None):
+    def _run_sleep_scoring_for_current_ids(
+        self,
+        delta_band=None,
+        theta_band=None,
+        low_freq_max_hz=None,
+        locomotion_threshold=None,
+        min_sleep_state_sec=None,
+        rem_only_from_nrem=None,
+    ):
         progress_dialog = ScoringProgressDialog(self)
         progress_dialog.show()
         QApplication.processEvents()
+
+        parsed_rules = self._parse_classification_rule_entries()
+        if parsed_rules is None:
+            progress_dialog.close()
+            return None
+        self.locomotion_threshold = parsed_rules["locomotion_threshold"]
+        self.min_sleep_state_sec = parsed_rules["min_sleep_state_sec"]
+        self.rem_only_from_nrem = parsed_rules["rem_only_from_nrem"]
+        if locomotion_threshold is None:
+            locomotion_threshold = parsed_rules["locomotion_threshold"]
+        if min_sleep_state_sec is None:
+            min_sleep_state_sec = parsed_rules["min_sleep_state_sec"]
+        if rem_only_from_nrem is None:
+            rem_only_from_nrem = parsed_rules["rem_only_from_nrem"]
 
         def _progress_cb(fraction, message):
             progress_dialog.update_progress(fraction, message)
@@ -1284,6 +1324,9 @@ class VideoAnalysisApp(QMainWindow):
                 delta_band=delta_band,
                 theta_band=theta_band,
                 low_freq_max_hz=low_freq_max_hz,
+                locomotion_threshold=locomotion_threshold,
+                min_sleep_state_sec=min_sleep_state_sec,
+                rem_only_from_nrem=rem_only_from_nrem,
                 progress_callback=_progress_cb,
                 simulated_npz=self._simulation_npz_path(),
                 filename_suffix=self._simulation_suffix(),
@@ -1359,9 +1402,19 @@ class VideoAnalysisApp(QMainWindow):
             self.emg_rms_threshold = float(np.nanmedian(self.emg_rms_10hz))
         if not np.isfinite(self.theta_delta_ratio_threshold):
             self.theta_delta_ratio_threshold = 2.0
-        self.locomotion_threshold = float(sleep_state.get("locomotion_threshold", 0.1))
+        self.locomotion_threshold = float(
+            sleep_state.get("locomotion_threshold", DEFAULT_LOCOMOTION_THRESHOLD)
+        )
         if not np.isfinite(self.locomotion_threshold):
-            self.locomotion_threshold = 0.1
+            self.locomotion_threshold = DEFAULT_LOCOMOTION_THRESHOLD
+        min_sleep_state_sec = sleep_state.get("min_sleep_state_sec", DEFAULT_MIN_SLEEP_STATE_SEC)
+        try:
+            self.min_sleep_state_sec = float(min_sleep_state_sec)
+        except Exception:
+            self.min_sleep_state_sec = DEFAULT_MIN_SLEEP_STATE_SEC
+        if not np.isfinite(self.min_sleep_state_sec) or self.min_sleep_state_sec < 0:
+            self.min_sleep_state_sec = DEFAULT_MIN_SLEEP_STATE_SEC
+        self.rem_only_from_nrem = bool(sleep_state.get("rem_only_from_nrem", True))
         self.left_video_crop = self._coerce_crop_rect(sleep_state.get("left_video_crop"))
         self.right_video_crop = self._coerce_crop_rect(sleep_state.get("right_video_crop"))
 
@@ -1411,6 +1464,10 @@ class VideoAnalysisApp(QMainWindow):
         self.thetaBandLowEdit.setText(f"{self.theta_band[0]:.2f}")
         self.thetaBandHighEdit.setText(f"{self.theta_band[1]:.2f}")
         self.lowFreqMaxEdit.setText(f"{self.low_freq_max_hz:.2f}")
+        self.minSleepStateEdit.setText(f"{self.min_sleep_state_sec:.4g}")
+        self.remOnlyFromNremCheck.blockSignals(True)
+        self.remOnlyFromNremCheck.setChecked(bool(self.rem_only_from_nrem))
+        self.remOnlyFromNremCheck.blockSignals(False)
         for widget in [
             self.deltaBandLowEdit,
             self.deltaBandHighEdit,
@@ -1518,6 +1575,49 @@ class VideoAnalysisApp(QMainWindow):
 
         return (delta_low, delta_high), (theta_low, theta_high), float(low_freq_max)
 
+    def _parse_classification_rule_entries(self):
+        try:
+            locomotion_threshold = float(self.locomotionThresholdEdit.text())
+            min_sleep_state_sec = float(self.minSleepStateEdit.text())
+        except Exception:
+            QMessageBox.warning(self, "Classification input error", "Classification settings must be numeric.")
+            return None
+
+        if not np.isfinite(locomotion_threshold):
+            QMessageBox.warning(self, "Classification input error", "Locomotion threshold must be finite.")
+            return None
+        if not np.isfinite(min_sleep_state_sec) or min_sleep_state_sec < 0:
+            QMessageBox.warning(self, "Classification input error", "Min sleep duration must be >= 0.")
+            return None
+
+        return {
+            "locomotion_threshold": float(locomotion_threshold),
+            "min_sleep_state_sec": float(min_sleep_state_sec),
+            "rem_only_from_nrem": bool(self.remOnlyFromNremCheck.isChecked()),
+        }
+
+    def _on_classification_rule_changed(self):
+        settings = self._parse_classification_rule_entries()
+        if settings is None:
+            self.minSleepStateEdit.setText(f"{float(self.min_sleep_state_sec):.4g}")
+            self.locomotionThresholdEdit.setText(f"{float(self.locomotion_threshold):.4g}")
+            self.remOnlyFromNremCheck.blockSignals(True)
+            self.remOnlyFromNremCheck.setChecked(bool(self.rem_only_from_nrem))
+            self.remOnlyFromNremCheck.blockSignals(False)
+            return
+
+        self.locomotion_threshold = settings["locomotion_threshold"]
+        self.min_sleep_state_sec = settings["min_sleep_state_sec"]
+        self.rem_only_from_nrem = settings["rem_only_from_nrem"]
+
+        if self.loaded:
+            if self._threshold_outside_slider_ranges():
+                self._rebuild_threshold_widgets_for_current_values()
+            self._sync_threshold_widgets_to_values()
+            self._state_dirty = True
+            self._update_save_button_state()
+            self.rerun_classification()
+
     def _bands_changed(self, delta_band, theta_band, low_freq_max_hz):
         tol = 1e-6
         def diff(a, b):
@@ -1565,6 +1665,9 @@ class VideoAnalysisApp(QMainWindow):
         if bands is None:
             return
         delta_band_vals, theta_band_vals, low_freq_max_hz = bands
+        classification_settings = self._parse_classification_rule_entries()
+        if classification_settings is None:
+            return
 
         progress_dialog = ScoringProgressDialog(self)
         progress_dialog.show()
@@ -1578,6 +1681,9 @@ class VideoAnalysisApp(QMainWindow):
                 delta_band=delta_band_vals,
                 theta_band=theta_band_vals,
                 low_freq_max_hz=low_freq_max_hz,
+                locomotion_threshold=classification_settings["locomotion_threshold"],
+                min_sleep_state_sec=classification_settings["min_sleep_state_sec"],
+                rem_only_from_nrem=classification_settings["rem_only_from_nrem"],
                 progress_callback=progress_dialog.update_progress,
                 simulated_npz=self._simulation_npz_path(),
                 filename_suffix=self._simulation_suffix(),
@@ -2475,6 +2581,9 @@ class VideoAnalysisApp(QMainWindow):
                 self.epoch_features_data,
                 thresholds=thresholds,
                 auto_thresholds=False,
+                default_locomotion_threshold=float(self.locomotion_threshold),
+                min_sleep_state_sec=float(self.min_sleep_state_sec),
+                rem_only_from_nrem=bool(self.rem_only_from_nrem),
             )
         except Exception as exc:
             QMessageBox.critical(self, "Rescore error", f"Error during rescoring:\n{exc}")
@@ -2528,6 +2637,8 @@ class VideoAnalysisApp(QMainWindow):
         sleep_state["low_freq_threshold"] = float(self.low_freq_threshold)
         sleep_state["delta_power_threshold"] = float(self.low_freq_threshold)
         sleep_state["locomotion_threshold"] = float(self.locomotion_threshold)
+        sleep_state["min_sleep_state_sec"] = float(self.min_sleep_state_sec)
+        sleep_state["rem_only_from_nrem"] = bool(self.rem_only_from_nrem)
         sleep_state["low_freq_max_hz"] = float(self.low_freq_max_hz)
         sleep_state["left_video_crop"] = self._coerce_crop_rect(self.left_video_crop)
         sleep_state["right_video_crop"] = self._coerce_crop_rect(self.right_video_crop)
@@ -2660,6 +2771,8 @@ class VideoAnalysisApp(QMainWindow):
 
     def _on_threshold_text_edit_finished(self):
         if not self.loaded:
+            if self.sender() is self.locomotionThresholdEdit:
+                self._on_classification_rule_changed()
             return
         try:
             values = {
